@@ -1,0 +1,42 @@
+{
+  "name": "@guided-tour-s4marth/recorder",
+  "version": "0.1.1",
+  "description": "DEV-ONLY: click-to-record guided tour authoring overlay",
+  "license": "MIT",
+  "author": "DataGenie",
+  "keywords": ["guided-tour", "onboarding", "recorder", "authoring", "react"],
+  "repository": { "type": "git", "url": "https://github.com/samarthrgb/guided-tour", "directory": "packages/tour-recorder" },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "prepublishOnly": "pnpm run clean && pnpm run build"
+  },
+  "dependencies": {
+    "@guided-tour-s4marth/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.7.2"
+  }
+}
