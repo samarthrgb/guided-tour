@@ -6,6 +6,13 @@ export interface RecorderStep {
   body: string;
   placement: Step['placement'];
   interactionPath?: Step['prepare'];
+  // Interactive step authoring (see player advance/gate semantics).
+  advance?: Step['advance'];
+  gate?: Step['gate'];
+  allowSkip?: boolean;
+  // Centered-card image (modal slide / fallback) + alt text for a missing target.
+  image?: string;
+  fallbackBody?: string;
 }
 
 export interface RecorderGap {
@@ -38,6 +45,11 @@ export function exportRecording(
     body: s.body,
     placement: s.placement ?? 'auto',
     prepare: s.interactionPath?.length ? s.interactionPath : undefined,
+    advance: s.advance,
+    gate: s.gate,
+    allowSkip: s.allowSkip,
+    image: s.image,
+    fallbackBody: s.fallbackBody,
   }));
 
   return {

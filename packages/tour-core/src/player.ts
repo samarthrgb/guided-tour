@@ -2,8 +2,73 @@ import { driver } from 'driver.js';
 import type { DriveStep } from 'driver.js';
 import type { Tour, Step, ThemeOverrides } from './schema.js';
 import { resolveAnchor, waitForAnchor, type AnchorMetaMap } from './resolver.js';
-import { decodeLocator, waitForLocator } from './locator.js';
+import { decodeLocator, resolveLocator, resolveXPath, waitForLocator, type TourLocator } from './locator.js';
+import { showInteractiveStep, teardownInteractiveOverlay, repointInteractiveOverlay } from './interactive.js';
 import { emit } from './telemetry.js';
+
+// Resolve a step's target RIGHT NOW without emitting telemetry — used to check if
+// it's already rendered (so we can show instantly instead of waiting).
+function resolveNow(anchorId: string): Element | null {
+  const loc = decodeLocator(anchorId);
+  if (loc) return resolveLocator(loc).el;
+  try {
+    return document.querySelector(`[data-tour="${CSS.escape(anchorId)}"]`);
+  } catch {
+    return null;
+  }
+}
+
+// When a target isn't rendered yet (its section is still loading), walk UP its
+// xpath to the nearest ancestor that IS present — so the tour can point at that
+// section ("data is coming here") and snap to the exact element once it loads.
+function nearestRenderedAncestor(xpath: string): Element | null {
+  let parts = xpath.split('/');
+  for (let i = 0; i < 6 && parts.length > 1; i++) {
+    parts = parts.slice(0, -1);
+    const candidate = parts.join('/');
+    if (!candidate || candidate === '/' || candidate === '//') break;
+    const el = resolveXPath(candidate);
+    if (el) {
+      const tag = el.tagName.toLowerCase();
+      return tag === 'body' || tag === 'html' ? null : el; // too broad to be a "section"
+    }
+  }
+  return null;
+}
+
+// An element can be in the DOM but not yet "laid out": zero-size box, display:none,
+// visibility:hidden, or mid-load/animation. Showing a step on it would place the
+// spotlight/tooltip at the top-left corner (rect is {0,0,0,0}), so we must wait.
+function isLaidOut(el: Element): boolean {
+  const r = el.getBoundingClientRect();
+  if (r.width <= 1 || r.height <= 1) return false;
+  const cs = window.getComputedStyle(el as HTMLElement);
+  return cs.visibility !== 'hidden' && cs.display !== 'none';
+}
+
+// Resolve once the element actually has a visible box (or time out). Uses a
+// ResizeObserver for instant reaction plus a slow interval as a backstop (a
+// display:none → block flip doesn't always fire ResizeObserver).
+function waitForVisible(el: Element, timeoutMs: number): Promise<boolean> {
+  if (isLaidOut(el)) return Promise.resolve(true);
+  return new Promise<boolean>(resolve => {
+    let done = false;
+    let ro: ResizeObserver | null = null;
+    const tick = () => { if (isLaidOut(el)) finish(true); };
+    const iv = setInterval(tick, 100);
+    const to = setTimeout(() => finish(false), timeoutMs);
+    function finish(v: boolean): void {
+      if (done) return;
+      done = true;
+      try { ro?.disconnect(); } catch { /* ignore */ }
+      clearInterval(iv);
+      clearTimeout(to);
+      resolve(v);
+    }
+    try { ro = new ResizeObserver(tick); ro.observe(el); } catch { /* ignore */ }
+    tick();
+  });
+}
 
 export interface PlayerOptions {
   tour: Tour;
@@ -27,16 +92,15 @@ function waitMs(ms: number): Promise<void> {
 async function runPrepare(
   step: Step,
   anchorMeta: AnchorMetaMap,
-  navigate: PlayerOptions['navigate'],
   waitForElement: PlayerOptions['waitForElement'],
 ): Promise<void> {
   if (!step.prepare?.length) return;
 
   for (const action of step.prepare) {
     if (action.action === 'navigate') {
-      if (navigate) await navigate(action.route);
-      // Give React time to commit the new route before continuing
-      await waitMs(300);
+      // Navigation is handled centrally (ensureRoute) so Back can also return to
+      // the right page; skip it here to avoid a redundant double-navigate.
+      continue;
     } else if (action.action === 'click') {
       const el = resolveAnchor(action.anchorId, anchorMeta);
       if (el) (el as HTMLElement).click();
@@ -71,44 +135,57 @@ const TOUR_STYLESHEET = `
 .driver-popover-title {
   font-size: 15px; font-weight: 650; line-height: 1.35;
   color: var(--tour-text, #0f172a); margin: 0 0 6px;
+  padding-right: 56px; /* clear the top-right counter + close icon */
 }
 .driver-popover-description {
   font-size: 13px; line-height: 1.55;
   color: var(--tour-muted, #64748b); margin: 0;
 }
-.driver-popover-progress-text {
-  font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+/* Counter + ✕ on the SAME top line (small + quiet). The .driver-popover prefix
+   raises specificity so these beat driver.js's own (later-injected) defaults. */
+.driver-popover .driver-popover-close-btn {
+  top: 14px; right: 7px; padding: 0;
+  color: var(--tour-muted, #94a3b8); transition: color 0.15s ease;
+}
+.driver-popover .driver-popover-close-btn:hover { color: var(--tour-text, #0f172a); }
+.driver-popover .driver-popover-progress-text {
+  position: absolute; top: 20px; right: 42px; margin: 0;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--tour-muted, #94a3b8);
 }
-.driver-popover-footer { margin-top: 16px; gap: 8px; }
-.driver-popover-footer button {
-  font-family: inherit; font-size: 12.5px; font-weight: 600;
-  padding: 7px 14px; border-radius: calc(var(--tour-radius, 14px) * 0.55);
+.driver-popover .driver-popover-footer { margin-top: 18px; gap: 4px; }
+.driver-popover .driver-popover-footer button {
+  font-family: inherit; font-size: 11.5px; font-weight: 600; line-height: 1.35;
+  border-radius: calc(var(--tour-radius, 14px) * 0.5);
   cursor: pointer; text-shadow: none;
-  transition: background 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease, transform 0.06s ease;
+  transition: background 0.15s ease, filter 0.15s ease, transform 0.06s ease;
 }
-.driver-popover-footer button:active { transform: translateY(0.5px); }
-.driver-popover-footer button:focus-visible {
+.driver-popover .driver-popover-footer button:active { transform: translateY(0.5px); }
+.driver-popover .driver-popover-footer button:focus-visible {
   outline: 2px solid var(--tour-primary, #6366f1); outline-offset: 2px;
 }
-.driver-popover-next-btn, .driver-popover-done-btn {
-  background: var(--tour-primary, #6366f1);
-  color: var(--tour-primary-text, #ffffff);
-  border: 1px solid var(--tour-primary, #6366f1);
+/* Next — light/white surface button (stands out on the dark popover; no shift on hover). */
+.driver-popover .driver-popover-next-btn, .driver-popover .driver-popover-done-btn {
+  background: var(--tour-next-bg, #ffffff); color: var(--tour-next-text, #0f172a);
+  border: 1px solid var(--tour-next-bg, #ffffff);
+  padding: 6px 12px;
+  max-width: 190px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.driver-popover-next-btn:hover, .driver-popover-done-btn:hover {
-  filter: brightness(1.08);
+.driver-popover .driver-popover-next-btn:hover, .driver-popover .driver-popover-done-btn:hover {
+  background: var(--tour-next-bg, #ffffff); color: var(--tour-next-text, #0f172a); filter: none;
 }
-.driver-popover-prev-btn {
-  background: transparent; color: var(--tour-muted, #64748b);
-  border: 1px solid var(--tour-border, rgba(100,116,139,0.30));
+/* Back — ghost: no fill, no border. */
+.driver-popover .driver-popover-prev-btn {
+  background: transparent; border: 1px solid transparent; color: var(--tour-muted, #64748b); padding: 6px 10px;
 }
-.driver-popover-prev-btn:hover { background: var(--tour-hover, rgba(15,23,42,0.05)); }
-.driver-popover-close-btn {
-  color: var(--tour-muted, #94a3b8);
-  transition: color 0.15s ease, transform 0.15s ease;
+.driver-popover .driver-popover-prev-btn:hover { background: transparent; color: var(--tour-text, #0f172a); }
+/* Skip tour — quiet text link, bottom-left, no fill. */
+.driver-popover .driver-popover-skip-btn {
+  margin-right: auto; background: transparent; border: none; cursor: pointer;
+  color: var(--tour-muted, #94a3b8); font: inherit; font-size: 11.5px; font-weight: 500;
+  padding: 6px 2px; text-decoration: underline; text-underline-offset: 2px;
 }
-.driver-popover-close-btn:hover { color: var(--tour-text, #0f172a); transform: scale(1.12); }
+.driver-popover .driver-popover-skip-btn:hover { background: transparent; color: var(--tour-text, #0f172a); }
 .driver-popover-arrow-side-left.driver-popover-arrow { border-left-color: var(--tour-bg, #ffffff); }
 .driver-popover-arrow-side-right.driver-popover-arrow { border-right-color: var(--tour-bg, #ffffff); }
 .driver-popover-arrow-side-top.driver-popover-arrow { border-top-color: var(--tour-bg, #ffffff); }
@@ -146,28 +223,64 @@ function injectThemeStyle(theme: ThemeOverrides): void {
 // spotlight sliding/scrolling from one element to the next, instead of the
 // overlay vanishing and rebuilding (which a new instance per step would cause).
 
-type StepAction = 'next' | 'skip';
+type StepAction = 'next' | 'prev' | 'skip';
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
+
+// driver.js renders popover.description via innerHTML, so we compose safe HTML:
+// the (escaped) body text, optionally preceded by an image. The image is shown
+// only on centered cards (floating/modal "slides" and fallbacks), not squeezed
+// into an anchored popover beside a small element.
+// Keep a button label readable — long step titles get truncated in "Next: …".
+function truncate(s: string, max = 28): string {
+  return s.length > max ? s.slice(0, max - 1).trimEnd() + '…' : s;
+}
 
 function buildPopover(
   step: Step,
   stepNumber: number,
   totalVisible: number,
   isLast: boolean,
+  opts: { centered?: boolean; fallback?: boolean; nextTitle?: string | undefined; showBack?: boolean } = {},
 ): NonNullable<DriveStep['popover']> {
   type Side = 'top' | 'bottom' | 'left' | 'right';
   const side: Side | undefined =
     step.placement === 'auto' ? undefined : (step.placement as Side);
 
+  const bodyText = opts.fallback ? step.fallbackBody ?? step.body : step.body;
+  const imgHtml = opts.centered && step.image
+    ? `<img src="${escapeHtml(step.image)}" alt="" style="display:block;width:100%;max-height:320px;object-fit:contain;border-radius:8px;margin:0 0 10px;" />`
+    : '';
+  const description = imgHtml + (bodyText ? `<span>${escapeHtml(bodyText)}</span>` : '');
+
+  // Descriptive Next CTA: "Next: <upcoming step>" (or Finish on the last step).
+  // Truncate tighter here so the single-line CTA (capped + ellipsis in CSS) stays compact.
+  // Strip a redundant leading "Next up:"/"Next:" so we never render "Next: Next up: …".
+  const upcoming = opts.nextTitle?.replace(/^\s*next(\s+up)?\s*:?\s*/i, '').trim() || opts.nextTitle;
+  const nextBtnText = isLast ? 'Finish' : upcoming ? `Next: ${truncate(upcoming, 20)}` : 'Next →';
+  // Back only when the previous step is presentational too (never re-enter a
+  // completed interaction step). ✕ exits; "Skip tour" is injected in onPopoverRender.
+  const showButtons: NonNullable<DriveStep['popover']>['showButtons'] = opts.showBack
+    ? ['previous', 'next', 'close']
+    : ['next', 'close'];
+
   return {
     title: step.title,
-    description: step.body,
-    showButtons: ['next', 'close'],
+    description,
+    showButtons,
     showProgress: true,
     progressText: `${stepNumber} of ${totalVisible}`,
-    ...(isLast ? { nextBtnText: 'Done' } : {}),
+    nextBtnText,
+    prevBtnText: 'Back',
     ...(side ? { side } : {}),
   };
 }
+
+// (Interaction steps are rendered by showInteractiveStep in ./interactive.ts —
+// it owns the spotlight, tooltip, and the advance controller for the gate.)
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -200,76 +313,164 @@ export async function playTour(opts: PlayerOptions): Promise<void> {
     currentResolve = null;
     resolve?.(action);
   };
+
+  // driver.js handles PRESENTATIONAL steps. Created lazily and reused across
+  // consecutive presentational steps (so the spotlight animates between them);
+  // destroyed when we hand off to an interaction step (rendered by our own
+  // overlay) and recreated for the next presentational step.
+  let driverObj: ReturnType<typeof driver> | null = null;
+  const destroyDriver = () => {
+    if (driverObj) { const d = driverObj; driverObj = null; d.destroy(); }
+  };
+  const getDriver = () => {
+    if (driverObj) return driverObj;
+    driverObj = driver({
+      allowClose: true,
+      overlayColor: mergedTheme.overlayColor ?? '#0b1220',
+      overlayOpacity: mergedTheme.overlayOpacity ?? 0.55,
+      stagePadding: mergedTheme.stagePadding ?? 4,
+      stageRadius: mergedTheme.stageRadius ?? 6,
+      animate: mergedTheme.animate ?? true,
+      smoothScroll: true,
+      ...(mergedTheme.popoverClass ? { popoverClass: mergedTheme.popoverClass } : {}),
+      onNextClick: () => settle('next'),
+      onPrevClick: () => settle('prev'),
+      onCloseClick: () => settle('skip'),
+      onDestroyStarted: () => { settle('skip'); teardown(); },
+      // Inject a visible "Skip tour" button alongside driver's ✕. We only build
+      // the node here; the click is handled by a delegated document listener
+      // (see below) because driver.js recreates the footer button nodes on every
+      // re-render, which strips any listener attached directly to the button.
+      onPopoverRender: popover => {
+        if (popover.footerButtons?.querySelector('.driver-popover-skip-btn')) return;
+        const skip = document.createElement('button');
+        skip.type = 'button';
+        skip.textContent = 'Skip tour';
+        skip.className = 'driver-popover-skip-btn';
+        popover.footerButtons?.prepend(skip);
+      },
+    });
+    return driverObj;
+  };
+  let removeSkipDelegation: (() => void) | null = null;
   const teardown = () => {
     if (torn) return;
     torn = true;
-    driverObj.destroy();
+    removeSkipDelegation?.();
+    destroyDriver();
+    teardownInteractiveOverlay();
+    // Belt-and-suspenders: if driver left any DOM behind (stale instance, etc.),
+    // physically remove its popover/overlay so the tour visibly ends.
+    document.querySelectorAll('.driver-popover, .driver-overlay, svg.driver-overlay').forEach(n => n.remove());
+    document.documentElement.classList.remove('driver-active', 'driver-fade');
+    document.body.classList.remove('driver-active', 'driver-fade');
   };
 
-  const driverObj = driver({
-    allowClose: true,
-    overlayColor: mergedTheme.overlayColor ?? '#0b1220',
-    overlayOpacity: mergedTheme.overlayOpacity ?? 0.55,
-    stagePadding: mergedTheme.stagePadding ?? 8,
-    stageRadius: mergedTheme.stageRadius ?? 8,
-    animate: mergedTheme.animate ?? true,
-    smoothScroll: true,
-    ...(mergedTheme.popoverClass ? { popoverClass: mergedTheme.popoverClass } : {}),
-
-    // Manual mode (hooks defined): the buttons do only what these say, so we
-    // drive step transitions ourselves via highlight() — keeping one instance.
-    // Next does NOT destroy; we just resolve and the loop highlights the next
-    // step on the same instance (the animated move). Close/esc tear down.
-    onNextClick: () => settle('next'),
-    onCloseClick: () => settle('skip'),
-    onDestroyStarted: () => { settle('skip'); teardown(); },
-  });
+  // Delegated skip handler — survives driver recreating the button node. Capture
+  // phase + stopPropagation so driver's own footer-click delegation never sees it.
+  const onSkipClick = (e: Event) => {
+    const t = e.target as Element | null;
+    if (!t || !t.closest?.('.driver-popover-skip-btn')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    settle('skip'); // resolve the awaited step → loop runs teardown + onSkip
+    teardown();     // and force the overlay down regardless of driver state
+  };
+  document.addEventListener('click', onSkipClick, true);
+  removeSkipDelegation = () => document.removeEventListener('click', onSkipClick, true);
 
   const waitForAction = () => new Promise<StepAction>(resolve => { currentResolve = resolve; });
 
-  for (let i = 0; i < tour.steps.length; i++) {
+  // A step's effective route is the nearest `navigate` prepare at or before it.
+  // Making the route declarative (rather than only firing on the step that owns
+  // the navigate) lets BACK return to the correct page too — going back to a step
+  // whose page differs from the current one re-navigates instead of stalling.
+  const routeForStep = (idx: number): string | undefined => {
+    for (let k = idx; k >= 0; k--) {
+      const nav = tour.steps[k]?.prepare?.find(a => a.action === 'navigate');
+      if (nav && nav.action === 'navigate') return nav.route;
+    }
+    return undefined;
+  };
+  let currentRoute: string | undefined; // last route we navigated to
+
+  // Index-controlled so a step can send us BACK (presentational steps only).
+  let i = 0;
+  while (i < tour.steps.length) {
     const step = tour.steps[i];
-    if (!step) continue;
+    if (!step) { i++; continue; }
 
-    // ── 1. Run this step's prepare path (navigate + click + wait) ──────────
-    // This runs just before the step is shown, NOT at tour start.
-    // Navigations actually fire here, in the right sequence.
-    await runPrepare(step, anchorMeta, navigate, waitForElement);
+    // ── 1. Ensure we're on the right page, then run click/wait prepare ─────
+    // Navigate only when the target route differs from where we are (so same-page
+    // Back is instant — no redundant navigate/300ms wait).
+    const wantRoute = routeForStep(i);
+    if (wantRoute && wantRoute !== currentRoute) {
+      if (navigate) await navigate(wantRoute);
+      currentRoute = wantRoute;
+      await waitMs(300); // let React commit the new route before resolving the target
+    }
+    await runPrepare(step, anchorMeta, waitForElement);
 
-    // ── 2. Wait for the anchor element to appear in the DOM ────────────────
-    // Only wait the full timeout when this step navigated (new route renders
-    // async); otherwise a short wait, so a missing anchor doesn't hang for 5s.
+    // ── 2 & 3. Resolve the element to show ─────────────────────────────────
+    // Fast path: if the target is already rendered, show on it immediately (no
+    // wait). If it's still loading, point at its nearest rendered ancestor (the
+    // "section" — data is coming there) and remember to SNAP onto the exact
+    // element once it appears. Only when neither is available do we wait.
     const locator = step.anchorId ? decodeLocator(step.anchorId) : null;
+    let element: Element | undefined;
+    let renderFallback = false;
+    let pendingTarget: TourLocator | null = null; // target still loading → snap when ready
     if (step.anchorId) {
       const hadNav = step.prepare?.some(a => a.action === 'navigate') ?? false;
-      const timeout = hadNav ? 5000 : 1500;
-      if (locator) {
-        // Encoded multi-signal locator — wait for it to resolve (signals/heal).
-        await waitForLocator(locator, timeout);
-      } else if (waitForElement) {
-        await waitForElement(`[data-tour="${CSS.escape(step.anchorId)}"]`, timeout);
-      } else {
-        await waitForAnchor(step.anchorId, timeout);
-      }
-    }
+      // After an interactive step the user just triggered something that often
+      // renders the next target async — wait generously rather than skip it.
+      const prevInteractive = i > 0 && tour.steps[i - 1]?.advance === 'interaction';
+      const timeout = hadNav || prevInteractive ? 8000 : 2000;
 
-    // ── 3. Resolve element ────────────────────────────────────────────────
-    let element: Element | undefined;
-    if (step.anchorId) {
-      const el = resolveAnchor(step.anchorId, anchorMeta, tour.id, i);
+      const isInteractiveStep = step.advance === 'interaction';
+
+      let el = resolveNow(step.anchorId); // a) already rendered?
+      // Present but not laid out yet (loading / display:none / zero box) → treat as
+      // "not ready" so we wait below instead of rendering at the top-left corner.
+      if (el && !isLaidOut(el)) el = null;
+      if (!el && !isInteractiveStep && locator?.xpath) {
+        // b) (presentational only) loading → point at the nearest present section,
+        // snap to the target later. Interaction steps must wait for the REAL,
+        // visible target — never point at a section the user can't act on.
+        const section = nearestRenderedAncestor(locator.xpath);
+        if (section) { el = section; pendingTarget = locator; }
+      }
       if (!el) {
-        // Target missing — skip this step but keep the tour going. Telemetry
-        // (anchor.broken) already emitted by resolveAnchor.
-        missingAnchors.push(step.anchorId);
-        continue;
+        // c) nothing to point at yet → wait for the target to render.
+        if (locator) await waitForLocator(locator, timeout);
+        else if (waitForElement) await waitForElement(`[data-tour="${CSS.escape(step.anchorId)}"]`, timeout);
+        else await waitForAnchor(step.anchorId, timeout);
+        el = resolveAnchor(step.anchorId, anchorMeta, tour.id, i);
+        // It may have just appeared but not be laid out yet → wait for a real box.
+        // Only then is it safe to show; otherwise treat as missing (skip/fallback).
+        if (el && !isLaidOut(el)) {
+          const visible = await waitForVisible(el, timeout);
+          if (!visible) el = null;
+        }
       }
-      element = el;
-      // No manual scroll/settle here — driver.js (smoothScroll) scrolls the
-      // element into view and animates the stage as part of highlight().
+      if (!el) {
+        // Target missing. If the step carries fallback content (alt text and/or
+        // an image), render a centered card so the tour still teaches; else skip.
+        missingAnchors.push(step.anchorId);
+        if (step.image || step.fallbackBody) renderFallback = true;
+        else { i++; continue; }
+      } else {
+        element = el;
+      }
     }
 
-    stepNumber++;
+    stepNumber = i + 1;
     const isLast = i === tour.steps.length - 1;
+    const nextTitle = tour.steps[i + 1]?.title;
+    const interactive = step.advance === 'interaction' && !!element && !renderFallback;
+    // Back only when this step AND the previous one are presentational — never
+    // re-enter a completed interaction step (re-arming its gate could trap the user).
+    const showBack = !interactive && i > 0 && tour.steps[i - 1]?.advance !== 'interaction';
 
     // ── 4. Emit telemetry + notify step change ─────────────────────────────
     onStepChange?.(i);
@@ -278,14 +479,48 @@ export async function playTour(opts: PlayerOptions): Promise<void> {
       : { type: 'step.viewed' as const, tourId: tour.id, stepIndex: i };
     emit(viewedEvent);
 
-    // ── 5. Move the spotlight to this step (animated) and wait for action ──
-    driverObj.highlight({
-      ...(element ? { element } : {}),
-      popover: buildPopover(step, stepNumber, totalVisible, isLast),
-    });
-    shownCount++;
+    // ── 5. Show the step and wait for the user's action ───────────────────
+    // When we're pointing at a loading section, watch for the exact target and
+    // SNAP onto it once it renders (the overlay slides over). `active` guards
+    // against snapping after the step has already advanced.
+    let action: StepAction;
+    const watchAndSnap = (apply: (target: Element) => void): (() => void) | undefined => {
+      if (!pendingTarget) return undefined;
+      let active = true;
+      void waitForLocator(pendingTarget, 8000).then(async target => {
+        if (!target || !active || torn) return;
+        // Snap only once the target is actually laid out — otherwise we'd slide
+        // the overlay onto a zero-box element (top-left corner).
+        if (!isLaidOut(target)) {
+          const visible = await waitForVisible(target, 8000);
+          if (!visible || !active || torn) return;
+        }
+        apply(target);
+      });
+      return () => { active = false; };
+    };
 
-    const action = await waitForAction();
+    if (interactive) {
+      // Hand off from the presentational driver to our own interactive renderer
+      // (own non-blocking spotlight + tooltip + signal-based advance).
+      destroyDriver();
+      shownCount++;
+      const stopSnap = watchAndSnap(target => repointInteractiveOverlay(target));
+      action = await showInteractiveStep({ element: element!, step, stepNumber, totalVisible, theme: mergedTheme, nextTitle });
+      stopSnap?.();
+    } else {
+      // Presentational, floating (no target), or fallback (target missing) →
+      // a driver.js popover; with no element it renders as a centered card.
+      // Leaving interactive mode → remove the interactive overlay (driver takes over).
+      teardownInteractiveOverlay();
+      const centered = !element; // floating step or fallback → centered "slide"
+      const popover = buildPopover(step, stepNumber, totalVisible, isLast, { centered, fallback: renderFallback, nextTitle, showBack });
+      getDriver().highlight({ ...(element ? { element } : {}), popover });
+      shownCount++;
+      const stopSnap = watchAndSnap(target => getDriver().highlight({ element: target, popover }));
+      action = await waitForAction();
+      stopSnap?.();
+    }
 
     if (action === 'skip') {
       emit({ type: 'tour.skipped', tourId: tour.id, stepIndex: i });
@@ -293,13 +528,17 @@ export async function playTour(opts: PlayerOptions): Promise<void> {
       onSkip?.(i);
       return;
     }
+    if (action === 'prev') {
+      i = Math.max(0, i - 1); // Back — re-show the previous (presentational) step
+      continue;
+    }
     if (isLast) {
       emit({ type: 'tour.completed', tourId: tour.id });
       teardown();
       onComplete?.();
       return;
     }
-    // action === 'next' — loop continues; the next highlight() animates the move
+    i++; // action === 'next' — advance; the next highlight() animates the move
   }
 
   // Loop finished without the user skipping/completing mid-way.

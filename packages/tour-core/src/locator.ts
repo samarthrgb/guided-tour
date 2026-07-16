@@ -34,6 +34,28 @@ export interface TourLocator {
 
 const PREFIX = 'loc:';
 
+// Test-id attributes, in priority order. Apps differ on the convention — dg-ui
+// uses BOTH `data-test` (most common) and `data-testid`. We read/resolve against
+// all of them so the test-id (our strongest, most stable signal) is captured no
+// matter which the app emits. A recorded `testid` value resolves against any of
+// these at runtime, so older locators (assumed `data-testid`) stay compatible.
+const TESTID_ATTRS = ['data-testid', 'data-test'] as const;
+
+/** First test-id value present on the element (any supported attribute). */
+function readTestId(el: Element): string | undefined {
+  for (const attr of TESTID_ATTRS) {
+    const v = el.getAttribute(attr);
+    if (v) return v;
+  }
+  return undefined;
+}
+
+/** A selector matching `value` on ANY supported test-id attribute. */
+function testIdSelector(value: string): string {
+  const v = CSS.escape(value);
+  return TESTID_ATTRS.map(attr => `[${attr}="${v}"]`).join(',');
+}
+
 export function encodeLocator(loc: TourLocator): string {
   return PREFIX + JSON.stringify(loc);
 }
@@ -105,8 +127,10 @@ export function buildLocator(el: Element): TourLocator {
   const loc: TourLocator = { signature };
 
   // testid — only if it's on the element itself AND unique in the document.
-  const testid = el.getAttribute('data-testid') ?? undefined;
-  if (testid && document.querySelectorAll(`[data-testid="${CSS.escape(testid)}"]`).length === 1) {
+  // Reads any supported attribute (`data-testid` / `data-test`); uniqueness is
+  // checked across all of them so we never bind to an ambiguous test-id.
+  const testid = readTestId(el);
+  if (testid && document.querySelectorAll(testIdSelector(testid)).length === 1) {
     loc.testid = testid;
   }
   // dom id — only if it actually resolves back to this element.
@@ -131,11 +155,20 @@ function accessibleName(el: Element): string {
 }
 
 /** True if the element plausibly *is* the signature's target. Tag must match;
- *  any provided name/text must be contained. Lenient on role (often implicit). */
-export function signatureMatches(el: Element, sig: TourSignature): boolean {
+ *  any provided name/text must be contained. Lenient on role (often implicit).
+ *
+ *  `requireText` gates whether visible text must match. When resolving via a
+ *  PRECISE signal (xpath / id / testid) we pass false: that signal already
+ *  pinpointed one element, and inner text on data-driven screens legitimately
+ *  changes between recording and playback (counts, names, loaded rows). Holding
+ *  text strict there rejects the correct element. Self-heal (a broad signature
+ *  search) keeps it true, since text is what makes that search trustworthy. */
+export function signatureMatches(el: Element, sig: TourSignature, requireText = true): boolean {
   if (sig.tag && el.tagName.toLowerCase() !== sig.tag.toLowerCase()) return false;
-  const text = (el.textContent ?? '').trim().toLowerCase();
-  if (sig.text && !text.includes(sig.text.toLowerCase())) return false;
+  if (requireText && sig.text) {
+    const text = (el.textContent ?? '').trim().toLowerCase();
+    if (!text.includes(sig.text.toLowerCase())) return false;
+  }
   if (sig.name) {
     const name = accessibleName(el).toLowerCase();
     if (!name.includes(sig.name.toLowerCase())) return false;
@@ -157,15 +190,18 @@ export type LocatorStatus = 'ok' | 'healed' | 'mismatch' | 'broken';
 export function resolveLocator(loc: TourLocator): { el: Element | null; status: LocatorStatus } {
   let sawCandidate = false;
 
+  // Precise signals (xpath/id/testid) already pinpoint ONE element, so we don't
+  // require text to still match — only the tag (+ accessible name). This keeps
+  // data-driven screens (lists, charts, live counts) resolving at playback.
   const tryEl = (el: Element | null): { el: Element; status: LocatorStatus } | null => {
     if (!el) return null;
     sawCandidate = true;
-    return signatureMatches(el, loc.signature) ? { el, status: 'ok' } : null;
+    return signatureMatches(el, loc.signature, false) ? { el, status: 'ok' } : null;
   };
 
   // 1–4: encoded signals, each must resolve to a UNIQUE element + match signature.
   if (loc.testid) {
-    const r = tryEl(unique(document.querySelectorAll(`[data-testid="${CSS.escape(loc.testid)}"]`)));
+    const r = tryEl(unique(document.querySelectorAll(testIdSelector(loc.testid))));
     if (r) return r;
   }
   if (loc.domId) {

@@ -1,4 +1,4 @@
-export { parseTour, parseTours, Tour, Step, Condition, ThemeOverrides, InteractionAction } from './schema.js';
+export { parseTour, parseTours, Tour, Step, StepGate, Condition, ThemeOverrides, InteractionAction } from './schema.js';
 export type { Tour as TourType, Step as StepType, Condition as ConditionType, ThemeOverrides as ThemeOverridesType, InteractionAction as InteractionActionType } from './schema.js';
 export { evaluateCondition, isTourEligible } from './conditions.js';
 export type { RuntimeContext } from './conditions.js';

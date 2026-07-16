@@ -22,12 +22,39 @@ export const InteractionAction = z.discriminatedUnion('action', [
   }),
 ]);
 
+// Completion signal(s) for an interactive step — it advances when ANY match.
+export const StepGate = z.object({
+  // a URL query param appears/changes (e.g. "datasetId"), or the path matches a substring
+  route: z.object({ param: z.string().optional(), match: z.string().optional() }).optional(),
+  // the user clicks the highlighted target
+  click: z.boolean().optional(),
+  // an element (encoded locator) appears — e.g. results finished loading
+  appear: z.string().optional(),
+  // optional auto-advance after N ms (a time-based fallback)
+  timeoutMs: z.number().optional(),
+});
+
 export const Step = z.object({
   anchorId: z.string().optional(),
   title: z.string(),
   body: z.string(),
   placement: z.enum(['top', 'bottom', 'left', 'right', 'auto']).default('auto'),
   prepare: z.array(InteractionAction).optional(),
+  // undefined/'button' = advance on Next. 'interaction' = wait for the user to do
+  // something (the `gate`); the overlay becomes non-blocking so they can operate the UI.
+  advance: z.enum(['button', 'interaction']).optional(),
+  gate: StepGate.optional(),
+  // For interaction steps: show a "Skip" that advances WITHOUT doing the action
+  // (does not abandon the tour). Default true.
+  allowSkip: z.boolean().optional(),
+  // Optional image (URL or data URI) shown when the step renders as a centered
+  // card — i.e. a floating/modal step (a "slide") or a fallback (see below).
+  image: z.string().optional(),
+  // Fallback content shown as a centered card WHEN the target can't be resolved
+  // (e.g. a no-data user has no dataset selector, or a feature is flagged off).
+  // Without it, a missing-target step is silently skipped. `fallbackBody` is the
+  // alt text (defaults to `body`); pair with `image` to show a screenshot.
+  fallbackBody: z.string().optional(),
 });
 
 export const ThemeOverrides = z.object({
@@ -70,6 +97,7 @@ export const Tour = z.object({
 
 export type Condition = z.infer<typeof Condition>;
 export type InteractionAction = z.infer<typeof InteractionAction>;
+export type StepGate = z.infer<typeof StepGate>;
 export type Step = z.infer<typeof Step>;
 export type ThemeOverrides = z.infer<typeof ThemeOverrides>;
 export type Tour = z.infer<typeof Tour>;

@@ -46,7 +46,8 @@ export function resolveAnchor(
 
   const meta = metaMap[anchorId];
   if (meta?.testid) {
-    const el = document.querySelector(`[data-testid="${CSS.escape(meta.testid)}"]`);
+    const v = CSS.escape(meta.testid);
+    const el = document.querySelector(`[data-testid="${v}"],[data-test="${v}"]`);
     if (el) {
       emit({ type: 'anchor.fallback', anchorId, strategy: 'testid' });
       return el;
