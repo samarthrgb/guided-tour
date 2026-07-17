@@ -39,6 +39,11 @@ export const Step = z.object({
   title: z.string(),
   body: z.string(),
   placement: z.enum(['top', 'bottom', 'left', 'right', 'auto']).default('auto'),
+  // The route (pathname) this step's element lives on, captured at record time.
+  // The player navigates here before showing the step, so a tour plays correctly
+  // no matter which page it's started from. Optional for backward compatibility
+  // (older tours fall back to the nearest `prepare: navigate`).
+  route: z.string().optional(),
   prepare: z.array(InteractionAction).optional(),
   // undefined/'button' = advance on Next. 'interaction' = wait for the user to do
   // something (the `gate`); the overlay becomes non-blocking so they can operate the UI.
@@ -80,11 +85,18 @@ export const ThemeOverrides = z.object({
 export const Tour = z.object({
   id: z.string().min(1),
   title: z.string().nullish(),
-  type: z.enum(['onboarding', 'release']),
+  // onboarding → "See how DG works"; release → mapped to a release note by version;
+  // feature → mapped to a Help Center card by title.
+  type: z.enum(['onboarding', 'release', 'feature']),
   version: z.string().nullish(),
   status: z.enum(['active', 'deprecated', 'archived']).default('active'),
   conditions: z.array(Condition).default([]),
   theme: ThemeOverrides.nullish(),
+  // Opaque, app-defined "context" captured at record time (e.g. { experience:
+  // 'classic' }). The host restores it via applyContext() BEFORE the tour plays,
+  // so a tour recorded in one app mode replays in that mode. The library never
+  // interprets it — the app owns the keys. Unknown keys are ignored → forward-safe.
+  context: z.record(z.string(), z.unknown()).nullish(),
   steps: z.array(Step).min(1),
   // Per-user annotations computed by the backend on GET (keyed off the
   // userId the frontend passes). Not authored — read-only at runtime.

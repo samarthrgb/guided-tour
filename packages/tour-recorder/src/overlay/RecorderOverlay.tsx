@@ -14,6 +14,9 @@ interface DraftStep {
   title: string;
   body: string;
   placement: NonNullable<Step['placement']>;
+  // The route (pathname) this step was recorded on. The player navigates here
+  // before showing the step, so the tour plays from any starting page.
+  route?: string;
   interactionPath: InteractionAction[];
   // Interactive step: wait for the user to act (gate) before advancing.
   advance?: Step['advance'];
@@ -36,11 +39,11 @@ export interface RecorderOverlayProps {
    * at runtime with no code change / deploy. The host decides what to do with it
    * (e.g. publish to the backend, or create a ticket).
    */
-  onSubmit?: (result: ReturnType<typeof exportRecording>) => void;
+  onSubmit?: (result: ReturnType<typeof exportRecording>) => void | Promise<void>;
   /** Called when saving repairs to an existing tour (repair mode). The host
    *  should persist the edited steps to the existing tour (update by id) so the
    *  fix takes effect with no deploy. Falls back to onSubmit if not provided. */
-  onSaveRepair?: (result: ReturnType<typeof exportRecording>) => void;
+  onSaveRepair?: (result: ReturnType<typeof exportRecording>) => void | Promise<void>;
   /** Router navigate, used by Preview to replay `prepare` navigation steps.
    *  Without it, cross-screen preview can't change routes (same-screen still works). */
   navigate?: (route: string) => void | Promise<void>;
@@ -51,6 +54,9 @@ export interface RecorderOverlayProps {
   /** Fired once the overlay has consumed `repairTour` and loaded its steps. The
    *  host should clear its repairTour state so the same tour can be repaired again. */
   onRepairConsumed?: () => void;
+  /** Capture the app's current mode/context (e.g. { experience }) at record time.
+   *  Stored on the tour draft and restored via applyContext before replay. */
+  captureContext?: () => Record<string, unknown> | undefined;
 }
 
 // ── Per-step health (live, current-screen) ─────────────────────────────────────
@@ -87,6 +93,7 @@ function tourToDraftSteps(tour: Tour): DraftStep[] {
       placement: s.placement ?? 'auto',
       interactionPath: s.prepare ?? [],
     };
+    if (s.route) step.route = s.route;
     if (s.anchorId) step.anchorId = s.anchorId;
     if (s.advance) step.advance = s.advance;
     if (s.gate) step.gate = s.gate;
@@ -148,6 +155,42 @@ function firstChangedParam(beforeSearch: string, afterSearch: string): string | 
   return null;
 }
 
+// Downscale + re-encode an uploaded image before storing it on the step, so the
+// tour payload stays small (data URIs bloat the record) and the fallback card
+// renders fast. Falls back to the raw data URI if anything goes wrong.
+async function compressImage(file: File, maxDim = 1000, quality = 0.8): Promise<string> {
+  const raw = await new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(typeof r.result === 'string' ? r.result : '');
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+  try {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('decode failed'));
+      img.src = raw;
+    });
+    let { width, height } = img;
+    if (Math.max(width, height) > maxDim) {
+      const scale = maxDim / Math.max(width, height);
+      width = Math.round(width * scale);
+      height = Math.round(height * scale);
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return raw;
+    ctx.drawImage(img, 0, 0, width, height);
+    const out = canvas.toDataURL('image/jpeg', quality);
+    return out.length < raw.length ? out : raw; // keep whichever is smaller
+  } catch {
+    return raw;
+  }
+}
+
 // Classify what a click DID, which decides how the step advances at runtime.
 type ClickEffect =
   | { kind: 'navigate' }                          // changed the route path → replayed as `prepare`
@@ -181,12 +224,62 @@ function elementLabel(el: Element): string {
 }
 
 function locatorLabel(anchorId?: string): string {
-  if (!anchorId) return '◇ centered modal (no target)';
+  if (!anchorId) return 'Centered modal (no target)';
   const loc = decodeLocator(anchorId);
   if (!loc) return anchorId;
   const sig = loc.signature;
   const primary = sig.name || sig.text || loc.testid || loc.domId;
   return primary ? `${sig.tag} · ${primary}` : sig.tag;
+}
+
+// ── Target strength ─────────────────────────────────────────────────────────
+// How durable a captured element's locator is, from its strongest signal:
+//   strong — the element has its own unique test id (data-testid/data-test)
+//   medium — no own test id, but anchored to a nearby test id OR an element id
+//   weak   — none of the above; matched only by position (xpath) + text/signature
+// Surfaced per step so authors see which targets need a data-testid to survive a
+// UI refactor. Derived from a built locator (from a live element or a decoded id).
+type Strength = 'strong' | 'medium' | 'weak';
+interface TargetInfo {
+  tier: Strength;
+  via: string;
+  hint: string;
+}
+function targetInfoFromLocator(loc: ReturnType<typeof buildLocator>): TargetInfo {
+  if (loc.testid) return { tier: 'strong', via: 'data-testid', hint: 'Anchored to a unique test id — the most durable target. Survives most UI changes.' };
+  if (loc.scope) return { tier: 'medium', via: 'nearby test id', hint: 'No id on the element itself, so it’s anchored to a nearby test id + position. Fairly stable.' };
+  if (loc.domId) return { tier: 'medium', via: 'element id', hint: 'Anchored to the element’s id. Stable unless that id changes.' };
+  return { tier: 'weak', via: 'position + text', hint: 'No id found — matched by position and text, which can break on a redesign. Add a data-testid to this element for a durable anchor.' };
+}
+function targetInfoFromAnchor(anchorId?: string): TargetInfo | null {
+  if (!anchorId) return null;
+  const loc = decodeLocator(anchorId);
+  if (!loc) return null;
+  // decodeLocator yields a TourLocator with the same signal fields buildLocator emits.
+  return targetInfoFromLocator(loc as ReturnType<typeof buildLocator>);
+}
+const STRENGTH_META: Record<Strength, { color: string; bg: string; label: string }> = {
+  strong: { color: '#34d399', bg: 'rgba(52,211,153,0.14)', label: 'Strong' },
+  medium: { color: '#fbbf24', bg: 'rgba(251,191,36,0.14)', label: 'OK' },
+  weak: { color: '#f87171', bg: 'rgba(248,113,113,0.14)', label: 'Weak' },
+};
+
+// A small strength chip (dot + label). Reused in the step form and step list.
+function StrengthChip({ info, showLabel = true }: { info: TargetInfo; showLabel?: boolean }) {
+  const m = STRENGTH_META[info.tier];
+  return (
+    <span
+      title={`${m.label} target · ${info.via}\n${info.hint}`}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 5, flexShrink: 0,
+        padding: showLabel ? '2px 8px' : 0, borderRadius: 999,
+        background: showLabel ? m.bg : 'transparent',
+        color: m.color, fontSize: 10.5, fontWeight: 600, whiteSpace: 'nowrap',
+      }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: m.color, flexShrink: 0 }} />
+      {showLabel && <>{m.label} · {info.via}</>}
+    </span>
+  );
 }
 
 function currentRoute(): string {
@@ -300,7 +393,7 @@ function PathPills({ path }: { path: InteractionAction[] }) {
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmit, onSaveRepair, navigate, repairTour, onRepairConsumed }: RecorderOverlayProps) {
+export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmit, onSaveRepair, navigate, repairTour, onRepairConsumed, captureContext }: RecorderOverlayProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   // Repair mode: editing an existing tour. `recaptureIdx` is the step being
@@ -336,10 +429,19 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
   // editable in the form). undefined/'button' → Next; 'interaction' + gate → wait.
   const [stepAdvance, setStepAdvance] = useState<Step['advance']>(undefined);
   const [stepGate, setStepGate] = useState<StepGate | null>(null);
+  // The route the element being authored lives on — captured at form-open. For a
+  // click that navigated, this is the SOURCE page (before nav), NOT the destination,
+  // so the step highlights the control on the page it's actually on.
+  const [pendingRoute, setPendingRoute] = useState<string>('');
   // Optional centered-card image (modal slide / fallback) + alt text for when an
   // anchored target can't be resolved at runtime (e.g. a no-data user).
   const [stepImage, setStepImage] = useState('');
   const [stepFallbackBody, setStepFallbackBody] = useState('');
+  // Editing an ALREADY-recorded step (from the review list): the form is opened
+  // pre-filled with that step's content. Confirm updates it in place (title, body,
+  // advance/gate, image, fallback, placement) — the anchor is left untouched (use
+  // the re-target button to change it). null = not editing an existing step.
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
 
   // Record mode: the author walks through the real flow. Each click is captured,
   // classified (navigate / open menu / select / plain), and a detail form opens
@@ -363,6 +465,7 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
   const stepsCountRef = useRef(0); // live count for handlers inside stable effects
   const [tourId, setTourId] = useState('');
   const [submitted, setSubmitted] = useState(false);
+  const [saving, setSaving] = useState(false); // awaiting onSubmit/onSaveRepair
   // Two phases: recording (capture steps) → review (preview tiles, then submit).
   const [reviewing, setReviewing] = useState(false);
 
@@ -535,6 +638,7 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
         const target = findBestTarget(raw);
         setPendingEl(target);
         setPendingRect(target.getBoundingClientRect());
+        setPendingRoute(window.location.pathname); // current page (no nav happened)
         setStepTitle('Look here');
         setStepBody('');
         setStepPlacement('auto');
@@ -572,20 +676,23 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
         let advance: Step['advance'] = 'button';
         let gate: StepGate | null = null;
         if (effect.kind === 'navigate') {
-          // The click moved to a new screen → a gated "go here" step. Highlight
-          // the link/control they clicked; advance when the path is reached, so
-          // the tour navigates correctly when played from any starting page.
-          const path = window.location.pathname;
-          const seg = path.split('/').filter(Boolean).pop() || 'the next screen';
+          // The click moved to a new screen. Default to a PRESENTATIONAL "go here"
+          // step: highlight the control on its SOURCE page (before.path); the tour
+          // navigates on Next via the NEXT step's captured route. Authors who want
+          // the user to actually click it can switch to "Wait for navigation" in
+          // the Advance dropdown. (Fixes: step was forced interactive + its route
+          // was the destination, so the player pre-navigated and skipped it.)
+          const seg = window.location.pathname.split('/').filter(Boolean).pop() || 'the next screen';
           title = `Go to ${seg}`;
-          advance = 'interaction';
-          gate = { route: { match: path } };
+          advance = 'button';
+          gate = null;
         }
         else if (effect.kind === 'select') { title = `Select a value for "${effect.param}"`; advance = 'interaction'; gate = { route: { param: effect.param } }; }
         else if (effect.kind === 'open') { title = 'Open this'; advance = 'interaction'; gate = { click: true }; }
 
         setPendingEl(target);
         setPendingRect(target.getBoundingClientRect());
+        setPendingRoute(before.path); // SOURCE page (before this click navigated)
         setStepTitle(title);
         setStepBody('');
         setStepPlacement('auto');
@@ -624,8 +731,43 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
     };
   }, [recordingFlow]);
 
+  // Reset every step-form field (shared by confirm/cancel/edit paths).
+  const resetForm = useCallback(() => {
+    setPendingEl(null); setPendingRect(null); setFloatingForm(false);
+    setEditingIdx(null);
+    setStepTitle(''); setStepBody(''); setStepPlacement('auto');
+    setStepAdvance(undefined); setStepGate(null); setPendingRoute('');
+    setStepImage(''); setStepFallbackBody('');
+  }, []);
+
   // ── Confirm step ──────────────────────────────────────────────────────────
   const confirmStep = useCallback(() => {
+    // Editing an existing step (from the review list): update its content in place.
+    // The anchor/route/prepare are preserved — only the authored fields change.
+    if (editingIdx !== null) {
+      if (!stepTitle.trim()) return;
+      setSteps(prev => prev.map((s, i) => {
+        if (i !== editingIdx) return s;
+        const next: DraftStep = { ...s, title: stepTitle.trim(), body: stepBody.trim(), placement: stepPlacement };
+        // Set-or-remove optionals (exactOptionalPropertyTypes: never assign undefined).
+        if (stepAdvance === 'interaction' && stepGate) {
+          next.advance = 'interaction';
+          next.gate = stepGate;
+          next.allowSkip = true;
+        } else {
+          delete next.advance;
+          delete next.gate;
+          delete next.allowSkip;
+        }
+        if (stepImage.trim()) next.image = stepImage.trim(); else delete next.image;
+        if (stepFallbackBody.trim()) next.fallbackBody = stepFallbackBody.trim(); else delete next.fallbackBody;
+        return next;
+      }));
+      resetForm();
+      setSubmitted(false);
+      return;
+    }
+
     // A targeted step needs a captured element; a floating step needs neither.
     if ((!pendingEl && !floatingForm) || !stepTitle.trim()) return;
 
@@ -634,6 +776,9 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
       title: stepTitle.trim(),
       body: stepBody.trim(),
       placement: stepPlacement,
+      // SOURCE page the element lives on (captured at form-open) — for a nav click
+      // this is the page BEFORE it navigated, so the player shows it there.
+      route: pendingRoute || window.location.pathname,
       interactionPath: [...pendingPath],
     };
     if (pendingEl) {
@@ -655,12 +800,28 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
 
     setSteps(prev => [...prev, step]);
     setPendingPath([]); // reset path — starts fresh for the next step
-    setPendingEl(null); setPendingRect(null); setFloatingForm(false);
-    setStepTitle(''); setStepBody(''); setStepPlacement('auto');
-    setStepAdvance(undefined); setStepGate(null);
-    setStepImage(''); setStepFallbackBody('');
+    resetForm();
     setSubmitted(false);
-  }, [pendingEl, floatingForm, stepTitle, stepBody, stepPlacement, stepAdvance, stepGate, stepImage, stepFallbackBody, pendingPath]);
+  }, [pendingEl, floatingForm, editingIdx, stepTitle, stepBody, stepPlacement, stepAdvance, stepGate, pendingRoute, stepImage, stepFallbackBody, pendingPath, resetForm]);
+
+  // Open the step form to EDIT an already-recorded step's content (from review).
+  // The anchor stays as-is — only title/body/advance/image/fallback/placement are
+  // editable here; use the re-target button to change what the step points at.
+  const editStep = useCallback((idx: number) => {
+    const s = steps[idx];
+    if (!s) return;
+    setPendingEl(null); setPendingRect(null); setFloatingForm(false);
+    setEditingIdx(idx);
+    setStepTitle(s.title);
+    setStepBody(s.body);
+    setStepPlacement(s.placement);
+    setStepAdvance(s.advance);
+    setStepGate(s.gate ?? null);
+    setStepImage(s.image ?? '');
+    setStepFallbackBody(s.fallbackBody ?? '');
+    setPendingRoute(s.route ?? '');
+    setTimeout(() => titleInputRef.current?.focus(), 50);
+  }, [steps]);
 
   const onTitleKeyDown = (e: React.KeyboardEvent) => { if (e.key === 'Enter') confirmStep(); };
 
@@ -715,17 +876,25 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
   // ── Submit ──────────────────────────────────────────────────────────────────
   // Hands the recorded tour draft to the host. Each step targets its element by
   // an encoded locator+signature, so the tour works at runtime with no deploy.
-  const handleSubmit = () => {
-    const result = exportRecording(tourId, tourType, undefined, steps, []);
-    if (repairing && onSaveRepair) {
-      // Preserve the original id so we PATCH the existing record, not create a
-      // new one keyed by the (editable) title.
-      if (repairOriginalId.current) result.draft.id = repairOriginalId.current;
-      onSaveRepair(result);
-    } else {
-      onSubmit?.(result);
+  const handleSubmit = async () => {
+    if (saving) return;
+    const result = exportRecording(tourId, tourType, undefined, steps, [], captureContext?.());
+    setSaving(true);
+    try {
+      if (repairing && onSaveRepair) {
+        // Preserve the original id so we PATCH the existing record, not create a
+        // new one keyed by the (editable) title.
+        if (repairOriginalId.current) result.draft.id = repairOriginalId.current;
+        await onSaveRepair(result);
+      } else {
+        await onSubmit?.(result);
+      }
+      setSubmitted(true);
+    } catch {
+      /* host surfaces the error (RTK state) — just stop the spinner */
+    } finally {
+      setSaving(false);
     }
-    setSubmitted(true);
   };
 
   // ── Preview ───────────────────────────────────────────────────────────────
@@ -764,6 +933,7 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
     setStepAdvance(undefined);
     setStepGate(null);
     setStepImage(''); setStepFallbackBody('');
+    setEditingIdx(null);
     lastConfirmedRef.current = null;
     setReviewing(false);
     setRepairing(false);
@@ -776,6 +946,8 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
 
   return (
     <>
+      {/* Recorder stylesheet — keyframes + hover/focus/entrance transitions. */}
+      <style>{RECORDER_CSS}</style>
       {/* Hover highlight — shows what will be captured (tag · label) */}
       {isCapturing && hoveredRect && (
         <HighlightRing rect={hoveredRect} anchorId={hoveredAnchorId} isGap={false} />
@@ -793,213 +965,241 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
         <HighlightRing rect={stepHighlight.rect} anchorId={stepHighlight.anchorId} isGap={false} />
       )}
 
-      {/* Capture mode banner */}
-      {isCapturing && (
-        <div data-tour-recorder="1" style={{
-          position: 'fixed', top: 0, left: 0, right: 0, height: 44,
-          background: '#6366f1', color: '#fff', zIndex: 100001,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          gap: 16, fontSize: 13, fontWeight: 600,
-          fontFamily: 'system-ui, -apple-system, sans-serif',
-        }}>
-          <span>
-            {recaptureIdx !== null
-              ? `● Re-targeting step ${recaptureIdx + 1} — click the new element`
-              : '● Hover to target — click to capture  |  navigate freely, it will be recorded'}
-          </span>
-          <button
-            onClick={() => { setIsCapturing(false); setRecaptureIdx(null); setHoveredRect(null); setHoveredAnchorId(null); }}
-            style={btn('#ffffff33')}
-          >
-            ESC  Cancel
-          </button>
-        </div>
-      )}
-
-      {/* Recording banner — the author walks the real flow, one step at a time */}
-      {recordingFlow && (
-        <div data-tour-recorder="1" style={{
-          position: 'fixed', top: 0, left: 0, right: 0, height: 44,
-          background: '#4f46e5', color: '#fff', zIndex: 100001,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          gap: 16, fontSize: 13, fontWeight: 600,
-          fontFamily: 'system-ui, -apple-system, sans-serif',
-        }}>
-          <span>
-            {pendingEl
-              ? '✍️ Name this step in the panel, then “Add & continue”'
-              : captureMode === 'point'
-                ? `✋ Pointing — click anything to add a “look here” step (no navigation)${steps.length > 0 ? `  ·  ${steps.length} step${steps.length > 1 ? 's' : ''}` : ''}`
-                : `● Doing — click to perform & capture the real action${steps.length > 0 ? `  ·  ${steps.length} step${steps.length > 1 ? 's' : ''}` : ''}`}
-          </span>
-          {!pendingEl && (
-            <>
-              {/* Pointing / Doing toggle */}
-              <div style={{ display: 'flex', borderRadius: 6, overflow: 'hidden', border: '1px solid #ffffff44' }}>
-                <button
-                  onClick={() => setCaptureMode('point')}
-                  title="Point at elements and add explain/Next steps — clicks won't navigate"
-                  style={{ ...btn(captureMode === 'point' ? '#ffffff' : 'transparent'), color: captureMode === 'point' ? '#4f46e5' : '#fff', borderRadius: 0, padding: '5px 10px' }}>
-                  ✋ Point
-                </button>
-                <button
-                  onClick={() => setCaptureMode('do')}
-                  title="Perform the real flow — clicks navigate, open menus, select; each becomes an interactive step"
-                  style={{ ...btn(captureMode === 'do' ? '#ffffff' : 'transparent'), color: captureMode === 'do' ? '#4f46e5' : '#fff', borderRadius: 0, padding: '5px 10px' }}>
-                  ● Do
-                </button>
-              </div>
+      {/* Unified status pill — one compact, centered element for BOTH capture and
+          recording, instead of a full-width banner. Fewer things move on screen. */}
+      {(isCapturing || recordingFlow) && (() => {
+        const formOpen = !!pendingEl || floatingForm;
+        const active = isCapturing || captureMode === 'do';
+        const dot = active ? '#818cf8' : '#94a3b8';
+        const count = steps.length > 0 ? `  ·  ${steps.length} step${steps.length > 1 ? 's' : ''}` : '';
+        let text: string;
+        if (isCapturing) {
+          text = recaptureIdx !== null
+            ? `Re-targeting step ${recaptureIdx + 1} — click the new element`
+            : 'Click an element to capture — navigate freely, it’s recorded';
+        } else if (formOpen) {
+          text = 'Name this step in the panel, then Add & continue';
+        } else {
+          text = captureMode === 'point'
+            ? `Pointing — click anything to add a “look here” step${count}`
+            : `Recording — click to perform & capture${count}`;
+        }
+        return (
+          <div data-tour-recorder="1" className="tr-pill" style={{
+            position: 'fixed', top: 16, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 100001, display: 'flex', alignItems: 'center', gap: 12,
+            padding: '7px 8px 7px 16px', borderRadius: 999, maxWidth: '92vw',
+            background: 'rgba(11,15,26,0.92)', backdropFilter: 'blur(10px)',
+            border: `1px solid ${UI.border}`, color: UI.text, fontFamily: UI.font,
+            fontSize: 12.5, fontWeight: 600, boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+          }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: dot, flexShrink: 0, boxShadow: `0 0 0 4px ${dot}22` }} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{text}</span>
+            {isCapturing && (
               <button
-                onClick={() => { setRecordingFlow(false); setReviewing(steps.length > 0); }}
-                style={btn('#ffffff33')}
-              >
-                ⏹  Stop  (Esc)
+                className="tr-btn tr-ghost"
+                onClick={() => { setIsCapturing(false); setRecaptureIdx(null); setHoveredRect(null); setHoveredAnchorId(null); }}
+                style={{ ...btn('ghost'), padding: '5px 11px', minHeight: 28 }}>
+                Cancel
               </button>
-            </>
-          )}
-        </div>
-      )}
+            )}
+            {recordingFlow && !formOpen && (
+              <>
+                <span style={{ display: 'inline-flex', gap: 2, background: UI.bgInput, borderRadius: 999, padding: 2, border: `1px solid ${UI.border}` }}>
+                  {(['point', 'do'] as const).map(m => (
+                    <button
+                      key={m}
+                      className="tr-seg"
+                      onClick={() => setCaptureMode(m)}
+                      title={m === 'point' ? 'Point at elements — clicks won’t navigate' : 'Perform the real flow — clicks navigate, open menus, select'}
+                      style={{
+                        border: 'none', cursor: 'pointer', borderRadius: 999, padding: '4px 13px',
+                        fontSize: 12, fontWeight: 600, fontFamily: 'inherit',
+                        background: captureMode === m ? UI.accent : 'transparent',
+                        color: captureMode === m ? '#fff' : UI.muted,
+                      }}>
+                      {m === 'point' ? 'Point' : 'Do'}
+                    </button>
+                  ))}
+                </span>
+                <button
+                  className="tr-btn"
+                  onClick={() => { setRecordingFlow(false); setReviewing(steps.length > 0); }}
+                  style={{ ...btn('secondary'), padding: '5px 12px', minHeight: 28 }}>
+                  Stop
+                </button>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
-      {/* Toggle button */}
+      {/* Floating toggle (FAB) — pulses while capture/recording is live. */}
       <button
         data-tour-recorder="1"
+        className={`tr-fab${isCapturing || recordingFlow ? ' tr-fab-rec' : ''}`}
         onClick={() => setIsOpen(o => !o)}
         title="Tour Recorder"
         style={{
           position: 'fixed', bottom: 24, right: 24,
-          width: 48, height: 48, borderRadius: '50%',
-          background: isOpen ? '#334155' : '#6366f1',
-          border: 'none', color: '#fff', fontSize: 20,
-          cursor: 'pointer', zIndex: 100000,
-          boxShadow: '0 4px 16px rgba(99,102,241,0.45)',
+          width: 52, height: 52, borderRadius: '50%',
+          background: isOpen ? '#1b2333' : UI.accent,
+          border: `1px solid ${isOpen ? UI.border : 'transparent'}`,
+          color: '#fff', cursor: 'pointer', zIndex: 100000,
+          boxShadow: isOpen ? '0 6px 20px rgba(0,0,0,0.45)' : '0 6px 20px rgba(99,102,241,0.5)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          transition: 'background 0.15s',
-        }}
-      >
-        {isOpen ? '✕' : '⏺'}
+        }}>
+        {isOpen ? (
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        ) : (
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#fff" strokeWidth="1.6" opacity="0.5" /><circle cx="12" cy="12" r="5" fill="#fff" /></svg>
+        )}
       </button>
 
       {/* Panel */}
       {isOpen && (
-        <div ref={panelRef} data-tour-recorder="1" style={{
+        <div ref={panelRef} data-tour-recorder="1" className="tr-panel" style={{
           position: 'fixed',
-          ...(panelPos ? { left: panelPos.x, top: panelPos.y } : { bottom: 84, right: 24 }),
-          width: 370, maxHeight: minimized ? 44 : '80vh',
-          background: '#0f172a', border: '1px solid #1e293b',
-          borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
-          color: '#f1f5f9', fontFamily: 'system-ui, -apple-system, sans-serif',
-          fontSize: 13, zIndex: 99999,
-          display: 'flex', flexDirection: 'column', overflow: minimized ? 'hidden' : 'scroll',
+          ...(panelPos ? { left: panelPos.x, top: panelPos.y } : { bottom: 88, right: 24 }),
+          width: 384, maxHeight: minimized ? 46 : '82vh',
+          background: UI.bg, border: `1px solid ${UI.border}`,
+          borderRadius: UI.radius, boxShadow: '0 24px 70px rgba(0,0,0,0.62)',
+          color: UI.text, fontFamily: UI.font, fontSize: 13, zIndex: 99999,
+          display: 'flex', flexDirection: 'column', overflow: minimized ? 'hidden' : 'auto',
         }}>
 
           {/* Header */}
-          <div style={{ padding: '12px 14px', borderBottom: '1px solid #1e293b', flexShrink: 0 }}>
+          <div style={{ flexShrink: 0, borderBottom: `1px solid ${UI.border}` }}>
             {/* Title row doubles as the drag handle */}
             <div
               onMouseDown={startDrag}
-              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: minimized ? 0 : 10, cursor: 'move', userSelect: 'none' }}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-                ⠿ {repairing ? 'Repairing tour' : 'Tour Recorder'}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 14px', cursor: 'move', userSelect: 'none' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 2, flexShrink: 0, background: repairing ? '#fbbf24' : UI.accent, boxShadow: `0 0 0 3px ${repairing ? 'rgba(251,191,36,0.18)' : 'rgba(99,102,241,0.2)'}` }} />
+                <span style={{ fontSize: 13, fontWeight: 700, color: UI.text, letterSpacing: '-0.01em' }}>
+                  {repairing ? 'Editing tour' : 'Tour Recorder'}
+                </span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 {repairing && !minimized && (
                   <button
+                    className="tr-btn tr-ghost"
                     onClick={resetAll}
                     title="Discard this edit and start a brand-new tour"
-                    style={{ ...btn('#1e293b'), fontSize: 11, padding: '3px 8px', color: '#a5b4fc' }}>
-                    + New tour
+                    style={{ ...btn('ghost'), fontSize: 11.5, padding: '4px 10px', minHeight: 26, color: '#a5b4fc' }}>
+                    New tour
                   </button>
                 )}
                 <button
+                  className="tr-btn tr-ghost"
                   onClick={() => setMinimized(m => !m)}
                   title={minimized ? 'Expand' : 'Minimize'}
-                  style={{ ...btn('#1e293b'), fontSize: 13, padding: '2px 9px', lineHeight: 1 }}>
-                  {minimized ? '▢' : '—'}
+                  style={{ ...btn('icon'), minWidth: 26, minHeight: 26, borderColor: 'transparent' }}>
+                  {minimized
+                    ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 14h6v6M20 10h-6V4" /></svg>
+                    : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M5 12h14" /></svg>}
                 </button>
               </div>
             </div>
-            {repairing && (
-              <div style={{ fontSize: 11, color: '#fbbf24', marginBottom: 8 }}>
-                ✎ Editing an existing tour — Save updates it in place. Use “+ New tour” to create a fresh one.
+            {!minimized && (
+              <div style={{ padding: '0 14px 12px' }}>
+                {repairing && (
+                  <div style={{ fontSize: 11, color: '#fbbf24', marginBottom: 10, background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.22)', borderRadius: 8, padding: '6px 9px', lineHeight: 1.45 }}>
+                    Editing an existing tour — Save updates it in place. Use “New tour” to start fresh.
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={LBL}>Title</label>
+                    <input
+                      className="tr-input"
+                      value={tourId}
+                      onChange={e => setTourId(e.target.value)}
+                      placeholder="e.g. v4.14 · Top Stories"
+                      style={INPUT}
+                    />
+                  </div>
+                  <div style={{ width: 118, flexShrink: 0 }}>
+                    <label style={LBL}>Type</label>
+                    <select
+                      className="tr-input"
+                      value={tourType}
+                      onChange={e => setTourType(e.target.value as Tour['type'])}
+                      style={{ ...INPUT, height: 33, padding: '0 8px' }}
+                    >
+                      <option value="release">release</option>
+                      <option value="onboarding">onboarding</option>
+                      <option value="feature">feature</option>
+                    </select>
+                  </div>
+                </div>
+                <div style={{ fontSize: 10.5, color: UI.faint, marginTop: 6, lineHeight: 1.5 }}>
+                  {tourType === 'release'
+                    ? <>Name it the release version (<code style={CODE}>v4.14</code>) to map it to the release note.</>
+                    : tourType === 'feature'
+                      ? <>Name it exactly the Help Center card title (e.g. <code style={CODE}>Top Stories</code>).</>
+                      : <>Onboarding walkthrough — shown from the “See how DG works” entry point.</>}
+                </div>
               </div>
             )}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <div style={{ flex: 1 }}>
-                <label style={{ display: 'block', fontSize: 11, color: '#64748b', marginBottom: 3 }}>Title</label>
-                <input
-                  value={tourId}
-                  onChange={e => setTourId(e.target.value)}
-                  placeholder="e.g. v4.14  or  v4.14-knowledge-center"
-                  style={INPUT}
-                />
-              </div>
-              <div style={{ width: 120, flexShrink: 0 }}>
-                <label style={{ display: 'block', fontSize: 11, color: '#64748b', marginBottom: 3 }}>Type</label>
-                <select
-                  value={tourType}
-                  onChange={e => setTourType(e.target.value as Tour['type'])}
-                  style={{ ...INPUT, height: 31, padding: '0 8px' }}
-                >
-                  <option value="release">release</option>
-                  <option value="onboarding">onboarding</option>
-                </select>
-              </div>
-            </div>
-            <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>
-              Full release tour: name it the version (<code>v4.14</code>). Feature tour: prefix it (<code>v4.14-feature</code>).
-            </div>
           </div>
 
           {/* Pending path pills — shown between steps */}
-          {!pendingEl && !floatingForm && pendingPath.length > 0 && (
-            <div style={{ padding: '8px 14px', borderBottom: '1px solid #1e293b', background: '#060f1e', flexShrink: 0 }}>
-              <div style={{ fontSize: 11, color: '#475569', marginBottom: 2 }}>Recorded since last step:</div>
+          {!pendingEl && !floatingForm && editingIdx === null && pendingPath.length > 0 && (
+            <div style={{ padding: '8px 14px', borderBottom: `1px solid ${UI.border}`, background: UI.bgSunken, flexShrink: 0 }}>
+              <div style={{ fontSize: 10.5, color: UI.faint, marginBottom: 3 }}>Recorded since last step</div>
               <PathPills path={pendingPath} />
             </div>
           )}
 
-          {/* Step form — for a captured element OR a floating (centered-modal) step */}
-          {(pendingEl || floatingForm) && (() => {
+          {/* Step form — for a NEW captured element, a NEW floating step, OR editing
+              an existing step's content (from the review list). */}
+          {(pendingEl || floatingForm || editingIdx !== null) && (() => {
+            const editingStep = editingIdx !== null ? steps[editingIdx] : null;
             const loc = pendingEl ? buildLocator(pendingEl) : null;
-            const signals = loc
-              ? ([loc.testid && 'testid', loc.domId && 'id', loc.xpath && 'xpath'].filter(Boolean) as string[])
-              : [];
+            // Strength: from the live element (new capture) or the step's stored anchor (edit).
+            const info = loc ? targetInfoFromLocator(loc) : editingStep ? targetInfoFromAnchor(editingStep.anchorId) : null;
+            const hasTarget = !!pendingEl || !!editingStep?.anchorId;
+            const label = pendingEl ? elementLabel(pendingEl) : locatorLabel(editingStep?.anchorId);
             return (
-            <div style={{ padding: '12px 14px', borderBottom: '1px solid #1e293b', background: '#060f1e', flexShrink: 0 }}>
-              {pendingEl ? (
-                <>
-                  {/* Locator target status — captured automatically, no data-tour needed */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: '#10b981' }} />
-                    <code style={{
-                      fontSize: 11, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#6ee7b7',
-                    }}>
-                      {elementLabel(pendingEl)}
+            <div style={{ padding: '13px 14px', borderBottom: `1px solid ${UI.border}`, background: UI.bgElev, flexShrink: 0 }}>
+              {editingStep && (
+                <div style={{ fontSize: 11, fontWeight: 600, color: '#a5b4fc', marginBottom: 8 }}>
+                  Editing step {editingIdx! + 1}
+                </div>
+              )}
+              {/* Target quality card — how durable this step's anchor is */}
+              {hasTarget && info ? (
+                <div style={{ marginBottom: 10, padding: '9px 11px', borderRadius: 10, background: UI.bgSunken, border: `1px solid ${UI.border}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <code style={{ fontFamily: UI.mono, fontSize: 11.5, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: UI.text }}>
+                      {label}
                     </code>
-                    <span style={{ fontSize: 10, color: '#10b981' }}>✓ targetable</span>
+                    <StrengthChip info={info} />
                   </div>
-                  <div style={{ fontSize: 10, color: '#475569', marginBottom: 8 }}>
-                    Targets via {signals.join(' → ')} + signature — works at runtime with no code change.
+                  <div style={{ fontSize: 10.5, color: info.tier === 'weak' ? '#fca5a5' : UI.faint, marginTop: 6, lineHeight: 1.5 }}>
+                    {editingStep ? 'Anchor unchanged — use the re-target button in the list to change what this step points at.' : info.hint}
                   </div>
-                </>
+                </div>
               ) : (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: '#94a3b8' }} />
-                  <code style={{ fontSize: 11, flex: 1, color: '#cbd5e1' }}>◇ Centered modal — no target</code>
-                  <span style={{ fontSize: 10, color: '#94a3b8' }}>intro / banner</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, padding: '9px 11px', borderRadius: 10, background: UI.bgSunken, border: `1px solid ${UI.border}` }}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: UI.muted }} />
+                  <span style={{ fontSize: 11.5, flex: 1, color: UI.muted }}>Centered modal — no target</span>
+                  <span style={{ fontSize: 10.5, color: UI.faint }}>intro / banner</span>
                 </div>
               )}
 
               {/* Prepare path for this step */}
               {pendingPath.length > 0 && (
                 <div style={{ marginBottom: 8 }}>
-                  <div style={{ fontSize: 11, color: '#475569', marginBottom: 2 }}>Prepare path for this step:</div>
+                  <div style={{ fontSize: 10.5, color: UI.faint, marginBottom: 3 }}>Prepare path for this step</div>
                   <PathPills path={pendingPath} />
                 </div>
               )}
 
               <input
                 ref={titleInputRef}
+                className="tr-input"
                 placeholder="Step title  (required)"
                 value={stepTitle}
                 onChange={e => setStepTitle(e.target.value)}
@@ -1007,6 +1207,7 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
                 style={{ ...INPUT, marginBottom: 6 }}
               />
               <textarea
+                className="tr-input"
                 placeholder="Description (optional)"
                 value={stepBody}
                 onChange={e => setStepBody(e.target.value)}
@@ -1015,16 +1216,17 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
               />
 
               {/* Advance mode — auto-detected from what the click did, editable. */}
-              {pendingEl && (() => {
+              {hasTarget && (() => {
                 const mode = stepAdvance !== 'interaction'
                   ? 'next'
                   : stepGate?.route?.param != null ? 'param'
                   : stepGate?.route?.match != null ? 'navigate'
                   : 'click';
                 return (
-                  <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                    <span style={{ fontSize: 11, color: '#94a3b8' }}>Advance:</span>
+                  <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 11, color: UI.muted, fontWeight: 600 }}>Advance</span>
                     <select
+                      className="tr-input"
                       value={mode}
                       onChange={e => {
                         const m = e.target.value;
@@ -1033,27 +1235,29 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
                         else if (m === 'navigate') { setStepAdvance('interaction'); setStepGate({ route: { match: stepGate?.route?.match || window.location.pathname } }); }
                         else { setStepAdvance('interaction'); setStepGate({ route: { param: stepGate?.route?.param || '' } }); }
                       }}
-                      style={{ ...INPUT, width: 'auto', flex: 'none', height: 28, padding: '0 6px', fontSize: 11 }}
+                      style={{ ...INPUT, width: 'auto', flex: 'none', height: 30, padding: '0 8px', fontSize: 11.5 }}
                     >
-                      <option value="next">▸ Next button</option>
-                      <option value="click">👆 Wait for click</option>
-                      <option value="param">◎ Wait for URL param</option>
-                      <option value="navigate">→ Wait for navigation</option>
+                      <option value="next">On Next button</option>
+                      <option value="click">Wait for click</option>
+                      <option value="param">Wait for URL param</option>
+                      <option value="navigate">Wait for navigation</option>
                     </select>
                     {mode === 'param' && (
                       <input
+                        className="tr-input"
                         value={stepGate?.route?.param || ''}
                         onChange={e => setStepGate({ route: { param: e.target.value } })}
                         placeholder="datasetId"
-                        style={{ ...INPUT, width: 120, flex: 'none', height: 28, padding: '0 6px', fontSize: 11, fontFamily: 'monospace' }}
+                        style={{ ...INPUT, width: 120, flex: 'none', height: 30, padding: '0 8px', fontSize: 11.5, fontFamily: UI.mono }}
                       />
                     )}
                     {mode === 'navigate' && (
                       <input
+                        className="tr-input"
                         value={stepGate?.route?.match || ''}
                         onChange={e => setStepGate({ route: { match: e.target.value } })}
                         placeholder="/app/explorer"
-                        style={{ ...INPUT, width: 150, flex: 'none', height: 28, padding: '0 6px', fontSize: 11, fontFamily: 'monospace' }}
+                        style={{ ...INPUT, width: 150, flex: 'none', height: 30, padding: '0 8px', fontSize: 11.5, fontFamily: UI.mono }}
                       />
                     )}
                   </div>
@@ -1061,18 +1265,19 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
               })()}
 
               {/* Image (modal "slide") + fallback (shown if the target is missing) */}
-              <div style={{ marginTop: 8, padding: '8px 10px', background: '#0b1220', borderRadius: 6, border: '1px solid #1e293b' }}>
-                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 4 }}>
-                  {pendingEl ? '🖼 Fallback (shown if the target isn’t on the page)' : '🖼 Slide image (optional)'}
+              <div style={{ marginTop: 10, padding: '9px 11px', background: UI.bgSunken, borderRadius: 10, border: `1px solid ${UI.border}` }}>
+                <div style={{ fontSize: 10.5, color: UI.muted, marginBottom: 6, fontWeight: 600 }}>
+                  {hasTarget ? 'Fallback image — shown if the target isn’t on the page' : 'Slide image (optional)'}
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                   <input
+                    className="tr-input"
                     value={stepImage}
                     onChange={e => setStepImage(e.target.value)}
                     placeholder="Image URL"
-                    style={{ ...INPUT, flex: 1, height: 28, padding: '0 6px', fontSize: 11 }}
+                    style={{ ...INPUT, flex: 1, height: 30, padding: '0 8px', fontSize: 11.5 }}
                   />
-                  <label style={{ ...btn('#334155'), fontSize: 11, padding: '5px 8px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center' }}>
+                  <label className="tr-btn" style={{ ...btn('secondary'), fontSize: 11.5, padding: '6px 11px', cursor: 'pointer', minHeight: 30 }}>
                     Upload
                     <input
                       type="file"
@@ -1081,43 +1286,45 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
                       onChange={e => {
                         const file = e.target.files?.[0];
                         if (!file) return;
-                        const reader = new FileReader();
-                        reader.onload = () => setStepImage(typeof reader.result === 'string' ? reader.result : '');
-                        reader.readAsDataURL(file);
+                        // Downscale + re-encode so the stored data URI stays small.
+                        void compressImage(file).then(setStepImage);
                       }}
                     />
                   </label>
                 </div>
                 {stepImage && (
-                  <img src={stepImage} alt="" style={{ marginTop: 6, maxWidth: '100%', maxHeight: 90, borderRadius: 4, display: 'block', objectFit: 'contain' }} />
+                  <img src={stepImage} alt="" style={{ marginTop: 7, maxWidth: '100%', maxHeight: 90, borderRadius: 6, display: 'block', objectFit: 'contain' }} />
                 )}
-                {pendingEl && (
+                {hasTarget && (
                   <input
+                    className="tr-input"
                     value={stepFallbackBody}
                     onChange={e => setStepFallbackBody(e.target.value)}
                     placeholder="Fallback text (defaults to the description)"
-                    style={{ ...INPUT, marginTop: 6, height: 28, padding: '0 6px', fontSize: 11 }}
+                    style={{ ...INPUT, marginTop: 7, height: 30, padding: '0 8px', fontSize: 11.5 }}
                   />
                 )}
               </div>
 
-              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+              <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
                 <select
+                  className="tr-input"
                   value={stepPlacement}
                   onChange={e => setStepPlacement(e.target.value as NonNullable<Step['placement']>)}
-                  style={{ ...INPUT, flex: 1, height: 30, padding: '0 8px' }}
+                  style={{ ...INPUT, flex: 1, height: 32, padding: '0 8px' }}
                 >
                   {(['auto', 'top', 'bottom', 'left', 'right'] as const).map(p => (
                     <option key={p} value={p}>{p}</option>
                   ))}
                 </select>
-                <button onClick={confirmStep} disabled={!stepTitle.trim()} style={btn(stepTitle.trim() ? '#6366f1' : '#1e293b')}>
-                  {recordingFlow ? 'Add & continue' : 'Add Step'}
+                <button className="tr-btn" onClick={confirmStep} disabled={!stepTitle.trim()} style={btn(stepTitle.trim() ? 'primary' : 'secondary')}>
+                  {editingIdx !== null ? 'Save changes' : recordingFlow ? 'Add & continue' : 'Add step'}
                 </button>
                 <button
-                  onClick={() => { setPendingEl(null); setPendingRect(null); setFloatingForm(false); setStepAdvance(undefined); setStepGate(null); setStepImage(''); setStepFallbackBody(''); }}
-                  style={btn('#374151')}>
-                  {recordingFlow ? 'Skip' : 'Cancel'}
+                  className="tr-btn tr-ghost"
+                  onClick={resetForm}
+                  style={btn('ghost')}>
+                  {editingIdx !== null ? 'Cancel' : recordingFlow ? 'Skip' : 'Cancel'}
                 </button>
               </div>
             </div>
@@ -1126,50 +1333,50 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
 
           {/* Review hint */}
           {reviewing && steps.length > 0 && (
-            <div style={{ padding: '8px 14px', borderBottom: '1px solid #1e293b', background: '#0b1220', flexShrink: 0, fontSize: 11, color: '#94a3b8' }}>
+            <div style={{ padding: '9px 14px', borderBottom: `1px solid ${UI.border}`, background: UI.bgElev, flexShrink: 0, fontSize: 11, color: UI.muted, lineHeight: 1.5 }}>
               {repairing
-                ? 'Repairing — badges show live health on this screen. Click ⟳ to re-target a broken step, then Save. (Navigate to a step’s screen to check it.)'
-                : 'Preview — hover or click a step to highlight it on the page. Remove any you don’t want, then Submit.'}
+                ? 'Repairing — badges show live health on this screen. Use the re-target button on a broken step, then Save.'
+                : 'Hover or click a step to highlight it on the page. The coloured dot shows how durable each target is.'}
             </div>
           )}
 
           {/* Steps list */}
           <div style={{ overflowY: 'auto', flex: 1 }}>
             {steps.length === 0 && !pendingEl ? (
-              <div style={{ padding: '28px 14px', textAlign: 'center', color: '#475569', lineHeight: 1.7 }}>
-                No steps yet.<br />
-                <span style={{ fontSize: 12 }}>Click <b style={{ color: '#818cf8' }}>● Record</b>, then click through the<br />flow — name each step as you go.</span>
+              <div style={{ padding: '32px 20px', textAlign: 'center', color: UI.faint, lineHeight: 1.7 }}>
+                <div style={{ fontSize: 13, color: UI.muted, fontWeight: 600, marginBottom: 4 }}>No steps yet</div>
+                <span style={{ fontSize: 12 }}>Hit <b style={{ color: '#a5b4fc' }}>Record</b> and click through the flow — name each step as you go.</span>
               </div>
             ) : (
-              steps.map((step, idx) => (
+              steps.map((step, idx) => {
+                const info = targetInfoFromAnchor(step.anchorId);
+                return (
                 <div
                   key={idx}
+                  className="tr-row"
                   onMouseEnter={() => highlightStep(step)}
                   onClick={() => highlightStep(step)}
-                  style={{ padding: '9px 14px', borderBottom: '1px solid #1e293b', display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}
-                  onMouseOver={e => (e.currentTarget.style.background = '#111827')}
-                  onMouseOut={e => (e.currentTarget.style.background = 'transparent')}
+                  style={{ padding: '10px 12px 10px 14px', borderBottom: `1px solid ${UI.border}`, display: 'flex', alignItems: 'flex-start', gap: 9, cursor: 'pointer' }}
                 >
-                  <span style={{ color: '#334155', fontSize: 11, marginTop: 2, width: 16, flexShrink: 0 }}>{idx + 1}</span>
+                  <span style={{ color: UI.faint, fontSize: 11, fontWeight: 600, marginTop: 3, width: 15, flexShrink: 0, textAlign: 'right' }}>{idx + 1}</span>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     {reviewing ? (
                       <input
+                        className="tr-input"
                         value={step.title}
                         onChange={e => updateStep(idx, { title: e.target.value })}
                         onClick={e => e.stopPropagation()}
                         placeholder="Step title"
-                        style={{
-                          ...INPUT, padding: '3px 6px', fontSize: 12, fontWeight: 500,
-                          background: '#0b1220', border: '1px solid #1e293b',
-                        }}
+                        style={{ ...INPUT, padding: '4px 7px', fontSize: 12.5, fontWeight: 500, background: UI.bgInput }}
                       />
                     ) : (
                       <div style={{ fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {step.title}
                       </div>
                     )}
-                    <div style={{ fontSize: 11, marginTop: 1, display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <code style={{ color: '#6ee7b7', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <div style={{ fontSize: 11, marginTop: 3, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {info && <StrengthChip info={info} showLabel={false} />}
+                      <code style={{ fontFamily: UI.mono, color: UI.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {locatorLabel(step.anchorId)}
                       </code>
                       {step.advance === 'interaction' && (() => {
@@ -1178,13 +1385,13 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
                         const title = g?.route?.param ? `waits for ?${g.route.param}` : g?.route?.match ? `waits until at ${g.route.match}` : 'waits for a click';
                         return (
                           <span style={{ fontSize: 10, color: '#a5b4fc', flexShrink: 0 }} title={title}>
-                            🖱 {label}
+                            {label}
                           </span>
                         );
                       })()}
                       {(step.image || step.fallbackBody) && (
                         <span style={{ fontSize: 10, color: '#fbbf24', flexShrink: 0 }} title={step.image ? 'Has fallback image/text' : 'Has fallback text'}>
-                          🖼 fallback
+                          fallback
                         </span>
                       )}
                       {reviewing && (() => {
@@ -1193,7 +1400,7 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
                         // that only exists after the PRIOR step opens it — so a live
                         // "broken" here is expected, not an error. Show a neutral note.
                         if (step.advance === 'interaction' && (h === 'broken' || h === 'mismatch')) {
-                          return <span style={{ fontSize: 10, color: '#94a3b8', flexShrink: 0 }} title="Target appears once the previous step runs (e.g. an open menu). Verify with Preview.">◷ at runtime</span>;
+                          return <span style={{ fontSize: 10, color: UI.muted, flexShrink: 0 }} title="Target appears once the previous step runs (e.g. an open menu). Verify with Preview.">at runtime</span>;
                         }
                         const b = healthBadge(h);
                         return <span style={{ fontSize: 10, color: b.color, flexShrink: 0 }}>{b.label}</span>;
@@ -1205,21 +1412,37 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
                   </div>
                   {reviewing && (
                     <button
+                      className="tr-btn tr-ghost"
+                      title="Edit this step — title, description, image / fallback, advance"
+                      onClick={e => { e.stopPropagation(); editStep(idx); }}
+                      style={{ ...btn('icon'), minWidth: 26, minHeight: 26, borderColor: 'transparent' }}
+                    ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg></button>
+                  )}
+                  {reviewing && (
+                    <button
+                      className="tr-btn tr-ghost"
                       title="Re-capture this step's target"
                       onClick={e => { e.stopPropagation(); setRecaptureIdx(idx); setIsCapturing(true); }}
-                      style={{ ...btn('#1e293b'), padding: '0 7px', minWidth: 24, flexShrink: 0 }}
-                    >⟳</button>
+                      style={{ ...btn('icon'), minWidth: 26, minHeight: 26, borderColor: 'transparent' }}
+                    ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg></button>
                   )}
                   {step.anchorId && (
                     <button
+                      className="tr-btn tr-ghost"
                       title="Remove target — show as a centered modal"
                       onClick={e => { e.stopPropagation(); makeStepFloating(idx); }}
-                      style={{ ...btn('#1e293b'), padding: '0 7px', minWidth: 24, flexShrink: 0 }}
-                    >◇</button>
+                      style={{ ...btn('icon'), minWidth: 26, minHeight: 26, borderColor: 'transparent' }}
+                    ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="7" width="16" height="10" rx="2" /></svg></button>
                   )}
-                  <button onClick={e => { e.stopPropagation(); removeStep(idx); }} style={{ ...btn('#1e293b'), padding: '0 7px', minWidth: 24, flexShrink: 0 }}>✕</button>
+                  <button
+                    className="tr-btn tr-ghost"
+                    title="Remove step"
+                    onClick={e => { e.stopPropagation(); removeStep(idx); }}
+                    style={{ ...btn('icon'), minWidth: 26, minHeight: 26, borderColor: 'transparent' }}
+                  ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg></button>
                 </div>
-              ))
+                );
+              })
             )}
           </div>
 
@@ -1230,27 +1453,30 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
               <>
                 {!pendingEl && !floatingForm && (
                   <button
+                    className="tr-btn"
                     onClick={() => { lastConfirmedRef.current = null; setRecordingFlow(true); }}
                     title="Walk through the flow. Each click is captured and you name it before continuing — navigations replay automatically, dropdowns become guided 'open then select' steps."
-                    style={btn('#6366f1')}>
-                    ● Record
+                    style={btn('primary')}>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7" /></svg>
+                    Record
                   </button>
                 )}
                 {!pendingEl && !floatingForm && (
                   <button
-                    onClick={() => { setFloatingForm(true); setStepTitle(''); setStepBody(''); setStepPlacement('auto'); setStepAdvance(undefined); setStepGate(null); setStepImage(''); setStepFallbackBody(''); setTimeout(() => titleInputRef.current?.focus(), 50); }}
+                    className="tr-btn"
+                    onClick={() => { setFloatingForm(true); setPendingRoute(window.location.pathname); setStepTitle(''); setStepBody(''); setStepPlacement('auto'); setStepAdvance(undefined); setStepGate(null); setStepImage(''); setStepFallbackBody(''); setTimeout(() => titleInputRef.current?.focus(), 50); }}
                     title="Add a centered modal step with no target (intro / banner)"
-                    style={btn('#334155')}>
+                    style={btn('secondary')}>
                     + Modal step
                   </button>
                 )}
                 {steps.length > 0 && !pendingEl && !floatingForm && (
-                  <button onClick={() => { setReviewing(true); setSubmitted(false); }} style={btn('#0d9488')}>
-                    ✓ Done
+                  <button className="tr-btn" onClick={() => { setReviewing(true); setSubmitted(false); }} style={btn('success')}>
+                    Review
                   </button>
                 )}
                 {steps.length > 0 && (
-                  <button onClick={resetAll} style={btn('#374151')}>
+                  <button className="tr-btn tr-ghost" onClick={resetAll} style={btn('ghost')}>
                     Clear
                   </button>
                 )}
@@ -1260,36 +1486,51 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
             {/* ── Recording in progress (form, if open, is shown above) ── */}
             {!reviewing && recordingFlow && !pendingEl && !floatingForm && (
               <>
-                <span style={{ fontSize: 12, color: '#a5b4fc', fontWeight: 600, alignSelf: 'center', marginRight: 'auto' }}>
-                  {captureMode === 'point' ? '✋ Pointing — click to explain (no navigation)' : '● Doing — click to perform & capture'}
+                <span style={{ fontSize: 12, color: UI.muted, fontWeight: 600, alignSelf: 'center', marginRight: 'auto' }}>
+                  {captureMode === 'point' ? 'Pointing — click to explain' : 'Recording — click to capture'}
                 </span>
                 <button
-                  onClick={() => { setFloatingForm(true); setStepTitle(''); setStepBody(''); setStepPlacement('auto'); setStepAdvance(undefined); setStepGate(null); setStepImage(''); setStepFallbackBody(''); setTimeout(() => titleInputRef.current?.focus(), 50); }}
+                  className="tr-btn"
+                  onClick={() => { setFloatingForm(true); setPendingRoute(window.location.pathname); setStepTitle(''); setStepBody(''); setStepPlacement('auto'); setStepAdvance(undefined); setStepGate(null); setStepImage(''); setStepFallbackBody(''); setTimeout(() => titleInputRef.current?.focus(), 50); }}
                   title="Add a centered modal step (e.g. a Welcome slide) — no target"
-                  style={btn('#334155')}>
+                  style={btn('secondary')}>
                   + Modal
                 </button>
                 <button
+                  className="tr-btn"
                   onClick={() => { setRecordingFlow(false); setReviewing(stepsCountRef.current > 0); }}
-                  style={btn('#dc2626')}>
-                  ⏹ Stop{stepsCountRef.current > 0 ? ` (${stepsCountRef.current})` : ''}
+                  style={btn('primary')}>
+                  Done{stepsCountRef.current > 0 ? ` · ${stepsCountRef.current}` : ''}
                 </button>
               </>
             )}
 
-            {/* ── Review phase: preview tiles, then Submit ── */}
+            {/* ── Review phase: preview, then Submit ── */}
             {reviewing && (
               <>
-                <button onClick={() => void handlePreview()} style={btn('#0d9488')}>
-                  ▶ Preview
+                <button className="tr-btn" onClick={() => void handlePreview()} style={btn('success')}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                  Preview
                 </button>
-                <button onClick={handleSubmit} disabled={!tourId.trim()} style={btn(tourId.trim() ? '#6366f1' : '#1e293b')}>
-                  {repairing ? '✓ Save repairs' : '✓ Submit tour'}
+                <button
+                  className="tr-btn"
+                  onClick={handleSubmit}
+                  disabled={!tourId.trim() || saving}
+                  style={btn(tourId.trim() && !saving ? 'primary' : 'secondary')}>
+                  {saving ? (
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <span style={SPINNER} /> Saving…
+                    </span>
+                  ) : repairing ? (
+                    'Save repairs'
+                  ) : (
+                    'Submit tour'
+                  )}
                 </button>
-                <button onClick={() => { setReviewing(false); setSubmitted(false); }} style={btn('#374151')}>
-                  ← Add more
+                <button className="tr-btn tr-ghost" onClick={() => { setReviewing(false); setSubmitted(false); }} style={btn('ghost')}>
+                  Add more
                 </button>
-                <button onClick={resetAll} style={btn('#374151')}>
+                <button className="tr-btn tr-ghost" onClick={resetAll} style={btn('ghost')}>
                   Clear
                 </button>
               </>
@@ -1298,9 +1539,10 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
 
           {/* Submitted confirmation */}
           {submitted && (
-            <div style={{ padding: '10px 14px', background: '#052e16', borderTop: '1px solid #166534', flexShrink: 0 }}>
-              <div style={{ fontSize: 12, color: '#4ade80', fontWeight: 600 }}>
-                ✓ Submitted — {steps.length} step{steps.length > 1 ? 's' : ''}
+            <div style={{ padding: '10px 14px', background: 'rgba(16,185,129,0.1)', borderTop: '1px solid rgba(16,185,129,0.28)', flexShrink: 0 }}>
+              <div style={{ fontSize: 12, color: '#4ade80', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>
+                Submitted — {steps.length} step{steps.length > 1 ? 's' : ''}
               </div>
             </div>
           )}
@@ -1310,18 +1552,90 @@ export function RecorderOverlay({ tourType: initialTourType = 'release', onSubmi
   );
 }
 
-// ─── Shared styles ────────────────────────────────────────────────────────────
-
-const INPUT: React.CSSProperties = {
-  width: '100%', background: '#1e293b', border: '1px solid #334155',
-  borderRadius: 6, color: '#f1f5f9', padding: '6px 10px',
-  fontSize: 12, outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit',
+// ─── Design tokens + shared styles ──────────────────────────────────────────
+// One cohesive dark-glass palette so the whole recorder reads as a single modern
+// surface. Kept minimal on purpose — fewer moving/competing colors.
+const UI = {
+  bg: '#0B0F1A',            // panel base
+  bgElev: '#101725',        // raised sections (form / header)
+  bgSunken: '#080C15',      // inset areas (path pills)
+  bgInput: '#141B2A',
+  border: 'rgba(148,163,184,0.14)',
+  text: '#E7ECF3',
+  muted: '#8A97AB',
+  faint: '#5A6678',
+  accent: '#6366F1',
+  radius: 16,
+  font: "'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif",
+  mono: "'SF Mono', ui-monospace, 'JetBrains Mono', Menlo, monospace",
 };
 
-function btn(bg: string): React.CSSProperties {
-  return {
-    background: bg, border: 'none', borderRadius: 6, color: '#f1f5f9',
-    cursor: 'pointer', fontSize: 12, padding: '5px 12px', minHeight: 30,
-    fontWeight: 500, whiteSpace: 'nowrap', flexShrink: 0,
+// Injected once. Real hover/focus/entrance transitions (inline styles can't do
+// pseudo-states) so interactions feel smooth without per-element JS handlers.
+const RECORDER_CSS = `
+@keyframes tour-rec-spin{to{transform:rotate(360deg)}}
+@keyframes tour-rec-panel{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes tour-rec-pill{from{opacity:0;transform:translate(-50%,-8px)}to{opacity:1;transform:translate(-50%,0)}}
+@keyframes tour-rec-pulse{0%,100%{box-shadow:0 6px 20px rgba(99,102,241,.5),0 0 0 0 rgba(99,102,241,.5)}50%{box-shadow:0 6px 20px rgba(99,102,241,.5),0 0 0 9px rgba(99,102,241,0)}}
+.tr-panel{animation:tour-rec-panel .2s cubic-bezier(.2,.7,.3,1) both}
+.tr-pill{animation:tour-rec-pill .2s cubic-bezier(.2,.7,.3,1) both}
+.tr-btn{transition:filter .14s ease,background-color .14s ease,color .14s ease,transform .06s ease;}
+.tr-btn:hover:not(:disabled){filter:brightness(1.14)}
+.tr-btn:active:not(:disabled){transform:translateY(.5px)}
+.tr-btn:disabled{opacity:.45;cursor:default}
+.tr-ghost{transition:background-color .14s ease,color .14s ease}
+.tr-ghost:hover:not(:disabled){background-color:rgba(148,163,184,.12) !important;color:${UI.text} !important}
+.tr-input{transition:border-color .14s ease,box-shadow .14s ease}
+.tr-input:focus{border-color:${UI.accent} !important;box-shadow:0 0 0 3px rgba(99,102,241,.2)}
+.tr-input::placeholder{color:${UI.faint}}
+.tr-row{transition:background-color .12s ease}
+.tr-row:hover{background-color:rgba(148,163,184,.06)}
+.tr-fab{transition:transform .18s ease,background-color .18s ease}
+.tr-fab:hover{transform:translateY(-2px)}
+.tr-fab-rec{animation:tour-rec-pulse 1.9s ease-in-out infinite}
+.tr-seg{transition:background-color .14s ease,color .14s ease}
+`;
+
+const INPUT: React.CSSProperties = {
+  width: '100%', background: UI.bgInput, border: `1px solid ${UI.border}`,
+  borderRadius: 9, color: UI.text, padding: '7px 10px',
+  fontSize: 12.5, outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit',
+};
+
+const LBL: React.CSSProperties = {
+  display: 'block', fontSize: 10.5, fontWeight: 600, color: UI.muted,
+  marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.06em',
+};
+
+const CODE: React.CSSProperties = {
+  fontFamily: UI.mono, background: UI.bgInput, padding: '1px 5px',
+  borderRadius: 4, fontSize: '0.95em', color: '#a5b4fc',
+};
+
+// Small spinning ring for in-flight actions (uses the injected @keyframes).
+const SPINNER: React.CSSProperties = {
+  width: 12, height: 12, borderRadius: '50%', display: 'inline-block',
+  border: '2px solid rgba(255,255,255,0.35)', borderTopColor: '#fff',
+  animation: 'tour-rec-spin 0.7s linear infinite',
+};
+
+// Semantic button variants → a consistent, modern button language. Pair with
+// className "tr-btn" (base transitions) or "tr-btn tr-ghost" for the ghost hover.
+type BtnVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'success' | 'icon';
+function btn(variant: BtnVariant = 'secondary'): React.CSSProperties {
+  const base: React.CSSProperties = {
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+    border: '1px solid transparent', borderRadius: 9, cursor: 'pointer',
+    fontSize: 12.5, padding: '6px 13px', minHeight: 32, fontWeight: 600,
+    whiteSpace: 'nowrap', flexShrink: 0, fontFamily: 'inherit', lineHeight: 1,
   };
+  switch (variant) {
+    case 'primary': return { ...base, background: UI.accent, color: '#fff' };
+    case 'success': return { ...base, background: '#0d9488', color: '#fff' };
+    case 'danger': return { ...base, background: 'transparent', color: '#f87171', borderColor: 'rgba(248,113,113,0.3)' };
+    case 'ghost': return { ...base, background: 'transparent', color: UI.muted };
+    case 'icon': return { ...base, background: 'transparent', color: UI.muted, padding: 0, minWidth: 30, minHeight: 30, borderColor: UI.border };
+    case 'secondary':
+    default: return { ...base, background: 'rgba(148,163,184,0.1)', color: UI.text, borderColor: UI.border };
+  }
 }

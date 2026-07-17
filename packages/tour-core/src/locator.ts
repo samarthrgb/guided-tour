@@ -20,6 +20,11 @@ export interface TourSignature {
 
 export interface TourLocator {
   testid?: string;
+  // Ancestor-testid anchor: when the element itself has no unique testid, bind to
+  // the nearest ancestor that DOES (`testid`) plus a direct-child CSS path down to
+  // the element (`path`, e.g. "div:nth-of-type(2) > button"). Far more stable than
+  // an absolute xpath, and keeps resolution testid-anchored.
+  scope?: { testid: string; path: string };
   domId?: string;
   role?: string;
   name?: string;
@@ -107,6 +112,40 @@ export function getXPath(el: Element): string {
   return '/' + segs.join('/');
 }
 
+// ── Ancestor-testid scope (relative path from a stable testid ancestor) ─────────
+/** CSS segment for `el` among its same-tag siblings, e.g. "button:nth-of-type(2)". */
+function relativeSeg(el: Element): string {
+  const tag = el.tagName.toLowerCase();
+  let i = 1;
+  for (let sib = el.previousElementSibling; sib; sib = sib.previousElementSibling) {
+    if (sib.tagName === el.tagName) i++;
+  }
+  return `${tag}:nth-of-type(${i})`;
+}
+
+/** Nearest ancestor (within `maxDepth`) carrying a UNIQUE test-id, plus a
+ *  direct-child path from it down to `el`. null if none found / path unverifiable. */
+function buildTestidScope(el: Element, maxDepth = 6): { testid: string; path: string } | null {
+  const segs: string[] = [];
+  let node: Element = el;
+  for (let depth = 0; depth < maxDepth && node.parentElement; depth++) {
+    segs.unshift(relativeSeg(node));
+    const parent = node.parentElement;
+    const tid = readTestId(parent);
+    if (tid && document.querySelectorAll(testIdSelector(tid)).length === 1) {
+      const path = segs.join(' > ');
+      try {
+        if (parent.querySelector(`:scope > ${path}`) === el) return { testid: tid, path };
+      } catch {
+        /* invalid selector — fall through */
+      }
+      return null;
+    }
+    node = parent;
+  }
+  return null;
+}
+
 // ── Build a multi-signal locator + signature for an element ────────────────────
 // Signals (testid → id → xpath) are each verified UNIQUE before being recorded,
 // so resolveLocator can trust them. The signature (tag/role/name/text) captures
@@ -132,6 +171,10 @@ export function buildLocator(el: Element): TourLocator {
   const testid = readTestId(el);
   if (testid && document.querySelectorAll(testIdSelector(testid)).length === 1) {
     loc.testid = testid;
+  } else {
+    // No own testid → anchor to the nearest ancestor testid + relative path.
+    const scope = buildTestidScope(el);
+    if (scope) loc.scope = scope;
   }
   // dom id — only if it actually resolves back to this element.
   if (el.id && document.getElementById(el.id) === el) loc.domId = el.id;
@@ -199,10 +242,22 @@ export function resolveLocator(loc: TourLocator): { el: Element | null; status: 
     return signatureMatches(el, loc.signature, false) ? { el, status: 'ok' } : null;
   };
 
-  // 1–4: encoded signals, each must resolve to a UNIQUE element + match signature.
+  // 1–5: encoded signals, each must resolve to a UNIQUE element + match signature.
+  // Order is testid-first (own testid → ancestor-testid scope) then id → xpath.
   if (loc.testid) {
     const r = tryEl(unique(document.querySelectorAll(testIdSelector(loc.testid))));
     if (r) return r;
+  }
+  if (loc.scope) {
+    const scopeEl = unique(document.querySelectorAll(testIdSelector(loc.scope.testid)));
+    if (scopeEl) {
+      try {
+        const r = tryEl(scopeEl.querySelector(`:scope > ${loc.scope.path}`));
+        if (r) return r;
+      } catch {
+        /* invalid selector — skip */
+      }
+    }
   }
   if (loc.domId) {
     const r = tryEl(document.getElementById(loc.domId));

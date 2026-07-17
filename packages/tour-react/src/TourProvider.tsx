@@ -34,6 +34,12 @@ export interface TourProviderProps {
   navigate?: (route: string) => void | Promise<void>;
   waitForElement?: (selector: string, timeoutMs?: number) => Promise<Element | null>;
   /**
+   * Restore the app mode/context a tour was recorded in (e.g. experience) before it
+   * plays. Receives the tour's `context` blob; the host owns the semantics. May
+   * return a Promise (e.g. to await an experience transition).
+   */
+  applyContext?: (context: Record<string, unknown>) => void | Promise<void>;
+  /**
    * Auto-start the tour the backend marked `autoplay: true` (the newest unseen
    * release for this user), once per session. Set false to disable. Default true.
    */
@@ -63,6 +69,7 @@ export function TourProvider({
   customPredicates,
   navigate,
   waitForElement,
+  applyContext,
   autoPlay = true,
 }: TourProviderProps) {
   const [tours, setTours] = useState<Tour[]>([]);
@@ -134,6 +141,7 @@ export function TourProvider({
       if (theme) opts.theme = theme;
       if (navigate) opts.navigate = navigate;
       if (waitForElement) opts.waitForElement = waitForElement;
+      if (applyContext) opts.applyContext = applyContext;
       // Completing and cancelling both mark the tour seen so it won't
       // auto-play again. Manual replays via startTour() still work.
       const finalize = async () => {
@@ -153,7 +161,7 @@ export function TourProvider({
 
       await playTour(opts);
     },
-    [tours, anchorMeta, theme, navigate, waitForElement, seenStore, userId, stopTour],
+    [tours, anchorMeta, theme, navigate, waitForElement, applyContext, seenStore, userId, stopTour],
   );
 
   // Auto-play the backend-designated tour (autoplay: true) once per session,

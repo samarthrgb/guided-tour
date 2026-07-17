@@ -5,6 +5,7 @@ export interface RecorderStep {
   title: string;
   body: string;
   placement: Step['placement'];
+  route?: string;
   interactionPath?: Step['prepare'];
   // Interactive step authoring (see player advance/gate semantics).
   advance?: Step['advance'];
@@ -38,12 +39,14 @@ export function exportRecording(
   version: string | undefined,
   steps: RecorderStep[],
   gaps: RecorderGap[],
+  context?: Record<string, unknown>,
 ): RecorderExport {
   const draftSteps: Step[] = steps.map(s => ({
     anchorId: s.anchorId,
     title: s.title,
     body: s.body,
     placement: s.placement ?? 'auto',
+    route: s.route,
     prepare: s.interactionPath?.length ? s.interactionPath : undefined,
     advance: s.advance,
     gate: s.gate,
@@ -62,6 +65,9 @@ export function exportRecording(
       type: tourType,
       version,
       conditions: [],
+      // App mode captured at record time (e.g. { experience: 'classic' }); the
+      // player restores it via applyContext before replay. Omitted when absent.
+      ...(context ? { context } : {}),
       steps: draftSteps,
     },
     gaps,

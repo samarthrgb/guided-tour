@@ -83,6 +83,10 @@ export interface PlayerOptions {
   onUnavailable?: (missingAnchors: string[]) => void;
   navigate?: (route: string) => void | Promise<void>;
   waitForElement?: (selector: string, timeoutMs?: number) => Promise<Element | null>;
+  /** Restore the app mode/context the tour was recorded in (e.g. experience) BEFORE
+   *  it plays. The host owns the semantics; the library just passes tour.context.
+   *  Should be idempotent and may return a Promise (e.g. to await a transition). */
+  applyContext?: (context: Record<string, unknown>) => void | Promise<void>;
 }
 
 function waitMs(ms: number): Promise<void> {
@@ -141,6 +145,25 @@ const TOUR_STYLESHEET = `
   font-size: 13px; line-height: 1.55;
   color: var(--tour-muted, #64748b); margin: 0;
 }
+/* Fallback / slide image: skeleton reserves space + shimmers until the image
+   decodes; the image fades in on load (onPopoverRender toggles .is-loaded). */
+.driver-popover .tour-img-wrap {
+  position: relative; width: 100%; min-height: 140px; max-height: 320px;
+  margin: 0 0 10px; border-radius: 8px; overflow: hidden;
+}
+.driver-popover .tour-img-skel {
+  position: absolute; inset: 0;
+  background: linear-gradient(100deg, rgba(148,163,184,0.12) 30%, rgba(148,163,184,0.28) 50%, rgba(148,163,184,0.12) 70%);
+  background-size: 200% 100%; animation: tour-img-shimmer 1.2s ease-in-out infinite;
+}
+.driver-popover .tour-img {
+  display: block; width: 100%; max-height: 320px; object-fit: contain;
+  border-radius: 8px; opacity: 0; transition: opacity 0.2s ease;
+}
+.driver-popover .tour-img-wrap.is-loaded { min-height: 0; }
+.driver-popover .tour-img-wrap.is-loaded .tour-img-skel { display: none; }
+.driver-popover .tour-img-wrap.is-loaded .tour-img { opacity: 1; }
+@keyframes tour-img-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 /* Counter + ✕ on the SAME top line (small + quiet). The .driver-popover prefix
    raises specificity so these beat driver.js's own (later-injected) defaults. */
 .driver-popover .driver-popover-close-btn {
@@ -190,8 +213,14 @@ const TOUR_STYLESHEET = `
 .driver-popover-arrow-side-right.driver-popover-arrow { border-right-color: var(--tour-bg, #ffffff); }
 .driver-popover-arrow-side-top.driver-popover-arrow { border-top-color: var(--tour-bg, #ffffff); }
 .driver-popover-arrow-side-bottom.driver-popover-arrow { border-bottom-color: var(--tour-bg, #ffffff); }
+/* Centered cards (floating "slides" + fallbacks) have no target: driver highlights
+   a center "dummy" element with side "over" and still emits an arrow (arrow-none is
+   only added when NO side fits). driver.css has no rule for arrow-side-over, so that
+   stray triangle shows and reads as if the card is anchored to the previous element.
+   Hide it so a targetless card is a clean, anchorless modal. */
+.driver-popover-arrow-side-over.driver-popover-arrow { display: none !important; }
 @keyframes tour-pop-in { from { opacity: 0; transform: translateY(6px) scale(0.98); } to { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) { .driver-popover { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .driver-popover { animation: none; } .driver-popover .tour-img-skel { animation: none; } }
 `;
 
 function injectThemeStyle(theme: ThemeOverrides): void {
@@ -251,8 +280,12 @@ function buildPopover(
     step.placement === 'auto' ? undefined : (step.placement as Side);
 
   const bodyText = opts.fallback ? step.fallbackBody ?? step.body : step.body;
+  // Image (centered/fallback cards only) wrapped with a skeleton placeholder that
+  // reserves space + shimmers while loading; onPopoverRender fades the image in and
+  // repositions once it decodes (so the popover doesn't jump). See TOUR_STYLESHEET.
   const imgHtml = opts.centered && step.image
-    ? `<img src="${escapeHtml(step.image)}" alt="" style="display:block;width:100%;max-height:320px;object-fit:contain;border-radius:8px;margin:0 0 10px;" />`
+    ? `<div class="tour-img-wrap"><div class="tour-img-skel"></div>` +
+      `<img class="tour-img" src="${escapeHtml(step.image)}" alt="" /></div>`
     : '';
   const description = imgHtml + (bodyText ? `<span>${escapeHtml(bodyText)}</span>` : '');
 
@@ -285,7 +318,7 @@ function buildPopover(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function playTour(opts: PlayerOptions): Promise<void> {
-  const { tour, anchorMeta = {}, theme, onComplete, onSkip, onStepChange, onUnavailable, navigate, waitForElement } = opts;
+  const { tour, anchorMeta = {}, theme, onComplete, onSkip, onStepChange, onUnavailable, navigate, waitForElement, applyContext } = opts;
 
   // Always inject — the stylesheet carries the polished defaults, and any theme
   // (provider theme < tour.theme) just overrides the CSS variables it sets.
@@ -342,6 +375,24 @@ export async function playTour(opts: PlayerOptions): Promise<void> {
       // (see below) because driver.js recreates the footer button nodes on every
       // re-render, which strips any listener attached directly to the button.
       onPopoverRender: popover => {
+        // Fallback/slide image: fade in + reposition once it decodes, so the
+        // popover is sized/centered correctly instead of jumping when the image
+        // pops in. The skeleton (reserved space + shimmer) shows until then.
+        const wrap = popover.wrapper?.querySelector('.tour-img-wrap');
+        const img = wrap?.querySelector('.tour-img') as HTMLImageElement | null;
+        if (wrap && img) {
+          const done = () => {
+            wrap.classList.add('is-loaded');
+            driverObj?.refresh(); // re-center/re-place now that height is known
+          };
+          if (img.complete && img.naturalWidth > 0) done();
+          else {
+            img.addEventListener('load', done, { once: true });
+            // On error, drop the skeleton so it doesn't shimmer forever.
+            img.addEventListener('error', () => wrap.classList.add('is-loaded'), { once: true });
+          }
+        }
+
         if (popover.footerButtons?.querySelector('.driver-popover-skip-btn')) return;
         const skip = document.createElement('button');
         skip.type = 'button';
@@ -381,18 +432,26 @@ export async function playTour(opts: PlayerOptions): Promise<void> {
 
   const waitForAction = () => new Promise<StepAction>(resolve => { currentResolve = resolve; });
 
-  // A step's effective route is the nearest `navigate` prepare at or before it.
-  // Making the route declarative (rather than only firing on the step that owns
-  // the navigate) lets BACK return to the correct page too — going back to a step
-  // whose page differs from the current one re-navigates instead of stalling.
+  // A step's effective route. Prefer the route captured on the step itself (the
+  // page its element lived on at record time) — that makes a tour play correctly
+  // from ANY starting page, and each step self-navigates to its own page. Fall
+  // back to the nearest `navigate` prepare at/before the step for older tours that
+  // predate per-step routes. Declarative either way, so BACK re-navigates too.
   const routeForStep = (idx: number): string | undefined => {
     for (let k = idx; k >= 0; k--) {
-      const nav = tour.steps[k]?.prepare?.find(a => a.action === 'navigate');
+      const s = tour.steps[k];
+      if (s?.route) return s.route;
+      const nav = s?.prepare?.find(a => a.action === 'navigate');
       if (nav && nav.action === 'navigate') return nav.route;
     }
     return undefined;
   };
   let currentRoute: string | undefined; // last route we navigated to
+
+  // Restore the app mode this tour was recorded in (experience, flags, …) BEFORE
+  // anything navigates or renders — host-owned semantics, idempotent, may await a
+  // transition animation. A tour recorded in the old experience thus replays there.
+  if (applyContext && tour.context) await applyContext(tour.context as Record<string, unknown>);
 
   // Index-controlled so a step can send us BACK (presentational steps only).
   let i = 0;
@@ -428,28 +487,34 @@ export async function playTour(opts: PlayerOptions): Promise<void> {
       const timeout = hadNav || prevInteractive ? 8000 : 2000;
 
       const isInteractiveStep = step.advance === 'interaction';
+      // A step with fallback content is ALWAYS anchorless when its target is
+      // missing — it renders as a centered modal (never anchored to a section).
+      const hasFallback = !!(step.image || step.fallbackBody);
+      // Fallback steps fall back FAST — don't make the user wait out the full
+      // resolve window on a genuinely-missing target; the centered card is graceful.
+      const resolveTimeout = hasFallback ? Math.min(timeout, 1500) : timeout;
 
       let el = resolveNow(step.anchorId); // a) already rendered?
       // Present but not laid out yet (loading / display:none / zero box) → treat as
       // "not ready" so we wait below instead of rendering at the top-left corner.
       if (el && !isLaidOut(el)) el = null;
-      if (!el && !isInteractiveStep && locator?.xpath) {
-        // b) (presentational only) loading → point at the nearest present section,
-        // snap to the target later. Interaction steps must wait for the REAL,
-        // visible target — never point at a section the user can't act on.
+      if (!el && !isInteractiveStep && !hasFallback && locator?.xpath) {
+        // b) (presentational, no-fallback only) loading → point at the nearest
+        // present section, snap to the target later. Interaction steps must wait
+        // for the REAL target; fallback steps go straight to a centered modal.
         const section = nearestRenderedAncestor(locator.xpath);
         if (section) { el = section; pendingTarget = locator; }
       }
       if (!el) {
         // c) nothing to point at yet → wait for the target to render.
-        if (locator) await waitForLocator(locator, timeout);
-        else if (waitForElement) await waitForElement(`[data-tour="${CSS.escape(step.anchorId)}"]`, timeout);
-        else await waitForAnchor(step.anchorId, timeout);
+        if (locator) await waitForLocator(locator, resolveTimeout);
+        else if (waitForElement) await waitForElement(`[data-tour="${CSS.escape(step.anchorId)}"]`, resolveTimeout);
+        else await waitForAnchor(step.anchorId, resolveTimeout);
         el = resolveAnchor(step.anchorId, anchorMeta, tour.id, i);
         // It may have just appeared but not be laid out yet → wait for a real box.
         // Only then is it safe to show; otherwise treat as missing (skip/fallback).
         if (el && !isLaidOut(el)) {
-          const visible = await waitForVisible(el, timeout);
+          const visible = await waitForVisible(el, resolveTimeout);
           if (!visible) el = null;
         }
       }

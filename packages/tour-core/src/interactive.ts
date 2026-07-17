@@ -207,11 +207,11 @@ export function showInteractiveStep(opts: {
     ov.body.textContent = step.body || '';
     ov.body.style.display = step.body ? 'block' : 'none';
     const hintText = gate.click
-      ? '👆 Click the highlighted item to continue'
+      ? 'Click the highlighted item to continue'
       : gate.route?.param
         ? 'Make your selection to continue'
         : gate.route?.match
-          ? '👆 Click to go to the next screen'
+          ? 'Click to go to the next screen'
           : gate.appear
             ? 'The tour continues on its own once ready'
             : '';
